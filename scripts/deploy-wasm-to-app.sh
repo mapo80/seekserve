@@ -2,14 +2,14 @@
 # Copies WASM build artifacts + JS glue files into the Flutter web app directory.
 # Usage: ./scripts/deploy-wasm-to-app.sh [wasm-build-dir]
 #
-# Default wasm-build-dir: build/wasm (Docker output) or first argument.
+# Default wasm-build-dir: build/wasm-out (Docker output) or first argument.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-WASM_BUILD="${1:-$ROOT_DIR/build/wasm}"
+WASM_BUILD="${1:-$ROOT_DIR/build/wasm-out}"
 APP_WEB="$ROOT_DIR/flutter_seekserve_app/web"
 PLUGIN_WEB="$ROOT_DIR/flutter_seekserve/web"
 
@@ -20,12 +20,15 @@ echo "  Plugin web dir: $PLUGIN_WEB"
 
 # 1. Copy Emscripten output (seekserve.js, seekserve.wasm, seekserve.worker.js)
 for f in seekserve.js seekserve.wasm seekserve.worker.js; do
-    src="$WASM_BUILD/seekserve-capi/$f"
-    if [ -f "$src" ]; then
-        cp "$src" "$APP_WEB/"
+    # Try flat layout (docker/build-wasm.sh output) first, then nested
+    if [ -f "$WASM_BUILD/$f" ]; then
+        cp "$WASM_BUILD/$f" "$APP_WEB/"
         echo "  Copied $f"
+    elif [ -f "$WASM_BUILD/seekserve-capi/$f" ]; then
+        cp "$WASM_BUILD/seekserve-capi/$f" "$APP_WEB/"
+        echo "  Copied $f (from seekserve-capi/)"
     else
-        echo "  WARNING: $src not found, skipping"
+        echo "  WARNING: $f not found in $WASM_BUILD, skipping"
     fi
 done
 

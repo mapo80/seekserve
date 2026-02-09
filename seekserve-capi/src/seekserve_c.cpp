@@ -258,3 +258,9 @@ void ss_free_string(char* str) {
 }
 
 } // extern "C"
+
+#ifdef __EMSCRIPTEN__
+// Emscripten executable entry point (required for PROXY_TO_PTHREAD).
+// Actual functionality is accessed via exported C functions (ccall/cwrap).
+int main() { return 0; }
+#endif

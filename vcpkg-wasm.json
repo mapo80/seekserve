@@ -21,7 +21,6 @@
     "boost-utility",
     "boost-variant",
     "nlohmann-json",
-    "openssl",
     "spdlog",
     "sqlite3"
   ],

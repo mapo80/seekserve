@@ -1,4 +1,10 @@
-if(SEEKSERVE_CAPI_STATIC)
+if(EMSCRIPTEN)
+    # Emscripten needs an executable target to produce .js + .wasm + .worker.js.
+    # A static/shared library would only produce a .a/.wasm side module.
+    add_executable(seekserve-capi
+        src/seekserve_c.cpp
+    )
+elseif(SEEKSERVE_CAPI_STATIC)
     add_library(seekserve-capi STATIC
         src/seekserve_c.cpp
     )

@@ -28,6 +28,8 @@
 #include "seekserve/control_api_server.hpp"
 #endif
 
+namespace net = boost::asio;
+
 namespace seekserve {
 
 /// High-level facade that owns and wires all SeekServe modules.

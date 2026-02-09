@@ -9,9 +9,9 @@ echo "=== SeekServe WASM Build (Docker) ==="
 echo "Project: $PROJECT_DIR"
 echo ""
 
-# Build Docker image
+# Build Docker image (emscripten/emsdk is linux/amd64 only)
 echo "[1/3] Building Docker image..."
-docker build -f "$SCRIPT_DIR/Dockerfile.wasm" -t seekserve-wasm-builder "$PROJECT_DIR"
+docker build --platform linux/amd64 -f "$SCRIPT_DIR/Dockerfile.wasm" -t seekserve-wasm-builder "$PROJECT_DIR"
 
 # Extract artifacts
 echo ""

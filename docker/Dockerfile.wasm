@@ -1,47 +1,114 @@
-FROM emscripten/emsdk:3.1.56
+# ============================================================
+# Stage 1: base — emscripten + system tools + vcpkg bootstrap
+# Invalidated only when base image or system packages change.
+# ============================================================
+FROM emscripten/emsdk:3.1.56 AS base
 
-# Install vcpkg dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl zip unzip tar pkg-config \
+    curl zip unzip tar pkg-config ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
-# Install vcpkg
 RUN git clone https://github.com/microsoft/vcpkg.git /opt/vcpkg \
     && /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 ENV VCPKG_ROOT=/opt/vcpkg
 
-# Copy source tree
+# ============================================================
+# Stage 2: deps — pre-install vcpkg packages
+# Invalidated only when vcpkg-wasm.json or the triplet changes.
+# Boost, OpenSSL, spdlog, sqlite3, etc. are cached here.
+# ============================================================
+FROM base AS deps
+
+WORKDIR /src
+COPY vcpkg-wasm.json vcpkg.json
+COPY triplets/wasm32-emscripten.cmake triplets/
+
+# Force -pthread via env vars so ALL build systems (CMake, configure, make)
+# compile with atomics+bulk-memory. VCPKG_C_FLAGS alone isn't enough because
+# the Emscripten chainload toolchain can override CMAKE_C_FLAGS_INIT.
+ENV CFLAGS="-pthread" CXXFLAGS="-pthread"
+RUN /opt/vcpkg/vcpkg install \
+    --overlay-triplets=/src/triplets \
+    --triplet=wasm32-emscripten \
+    --x-install-root=/opt/vcpkg-wasm
+
+# ============================================================
+# Stage 3: build — copy source, init submodules, compile
+# Invalidated on any source change, but vcpkg deps are cached.
+# ============================================================
+FROM deps AS build
+
 WORKDIR /src
 COPY . .
 
-# Initialize git submodules (libtorrent + deps)
-RUN git submodule update --init \
-    && cd extern/libtorrent \
-    && git submodule update --init --recursive --force \
-    && cd /src
-
-# Use WASM-specific vcpkg manifest (no boost-beast, no gtest)
+# Restore WASM manifest (COPY . . overwrites vcpkg.json with the full one)
 RUN cp /src/vcpkg-wasm.json /src/vcpkg.json
 
-# Configure and build WASM target
-RUN emcmake cmake -S /src -B /src/build/wasm \
+# Initialize git submodules (libtorrent + libdatachannel deps)
+RUN git submodule update --init \
+    && cd extern/libtorrent \
+    && git submodule update --init --recursive --force
+
+# Emscripten platform stubs:
+# 1. sys/sysctl.h — libtorrent's BSD fallback uses sysctl() to query physical
+#    memory. Emscripten lacks <sys/sysctl.h>, so we stub it (returns ENOSYS).
+# 2. enum_net.cpp patches — Emscripten has no real network interfaces.
+#    Replace the two #error directives with "not supported" stubs.
+#    Also set TORRENT_HAS_SALEN=0 since Emscripten sockaddr has no sa_len.
+RUN mkdir -p /src/emscripten-stubs/sys \
+    && printf '%s\n' \
+       '#pragma once' \
+       '#include <stddef.h>' \
+       '#include <errno.h>' \
+       '#define CTL_HW 6' \
+       '#define HW_PHYSMEM 5' \
+       '#define HW_MEMSIZE 12' \
+       'static inline int sysctl(const int *n, unsigned int nl,' \
+       '  void *o, size_t *ol, const void *np, size_t npl) {' \
+       '  (void)n;(void)nl;(void)o;(void)ol;(void)np;(void)npl;' \
+       '  errno = 38; return -1; }' \
+       'static inline int sysctlbyname(const char *n, void *o,' \
+       '  size_t *ol, const void *np, size_t npl) {' \
+       '  (void)n;(void)o;(void)ol;(void)np;(void)npl;' \
+       '  errno = 38; return -1; }' \
+       > /src/emscripten-stubs/sys/sysctl.h
+
+# Patch libtorrent for Emscripten compatibility
+RUN sed -i "s/#error \"Don't know how to enumerate network interfaces on this platform\"/ec = boost::asio::error::operation_not_supported;/" \
+       /src/extern/libtorrent/src/enum_net.cpp \
+    && sed -i 's/#error "don'\''t know how to enumerate network routes on this platform"/ec = boost::asio::error::operation_not_supported;/' \
+       /src/extern/libtorrent/src/enum_net.cpp
+
+# Configure — uses pre-installed vcpkg packages via VCPKG_INSTALLED_DIR.
+# VCPKG_CHAINLOAD_TOOLCHAIN_FILE must be passed explicitly on the cmake
+# command line so that vcpkg.cmake chain-loads Emscripten.cmake for the
+# PROJECT (not just for vcpkg's internal package builds). Without this,
+# CMAKE_SIZEOF_VOID_P stays 8 (host) instead of 4 (wasm32), and
+# find_package() rejects 32-bit packages like spdlog.
+RUN cmake -S /src -B /src/build/wasm \
     -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake \
     -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=/emsdk/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake \
     -DVCPKG_TARGET_TRIPLET=wasm32-emscripten \
     -DVCPKG_OVERLAY_TRIPLETS=/src/triplets \
     -DVCPKG_MANIFEST_DIR=/src \
+    -DVCPKG_INSTALLED_DIR=/opt/vcpkg-wasm \
     -DCMAKE_BUILD_TYPE=Release \
+    "-DCMAKE_C_FLAGS=-pthread -isystem /src/emscripten-stubs" \
+    "-DCMAKE_CXX_FLAGS=-pthread -DBOOST_ASIO_HAS_PTHREADS -DTORRENT_HAS_SALEN=0 -isystem /src/emscripten-stubs" \
     -DSEEKSERVE_BUILD_TESTS=OFF \
     -DSEEKSERVE_BUILD_DEMO=OFF \
     -DSEEKSERVE_BUILD_CAPI=ON \
     -DSEEKSERVE_CAPI_STATIC=ON \
-    -DSEEKSERVE_ENABLE_WEBTORRENT=OFF
+    -DSEEKSERVE_ENABLE_WEBTORRENT=OFF \
+    -Dencryption=OFF
 
 RUN cmake --build /src/build/wasm --target seekserve-capi -j$(nproc)
 
-# Output artifacts to /out for extraction
+# Collect output artifacts
 RUN mkdir -p /out \
-    && cp /src/build/wasm/seekserve-capi/seekserve.js /out/ 2>/dev/null || true \
-    && cp /src/build/wasm/seekserve-capi/seekserve.wasm /out/ 2>/dev/null || true \
+    && echo "=== Build output ===" \
+    && ls -lh /src/build/wasm/seekserve-capi/ \
+    && cp /src/build/wasm/seekserve-capi/seekserve.js /out/ \
+    && cp /src/build/wasm/seekserve-capi/seekserve.wasm /out/ \
     && cp /src/build/wasm/seekserve-capi/seekserve.worker.js /out/ 2>/dev/null || true

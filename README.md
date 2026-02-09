@@ -56,6 +56,7 @@ The SDK ships with three Flutter packages:
 - [Testing](#testing)
 - [Cross-Compilation](#cross-compilation)
 - [WebTorrent](#webtorrent)
+- [Web (WASM)](#web-wasm)
 - [Documentation Index](#documentation-index)
 - [Dependencies](#dependencies)
 - [License](#license)
@@ -1760,6 +1761,156 @@ These are automatically initialized by `setup.sh` (`git submodule update --init 
 ```
 
 The SDK falls back to standard BitTorrent only. Binary size decreases by ~30%.
+
+---
+
+## Web (WASM)
+
+SeekServe runs in the browser by compiling the **same C++ engine** to WebAssembly via Emscripten. The native HTTP Range server is replaced by a **Service Worker** that intercepts fetch requests and serves bytes directly from the WASM module. This means the entire torrent pipeline — piece scheduling, byte source, offline cache, alert handling — is identical across native and web.
+
+### Architecture
+
+```
+NATIVE:  Dart → dart:ffi → C API (.so/.a) → Engine → HttpRangeServer → HTTP URL → Player
+WASM:    Dart → dart:js_interop → JS glue → C API (.wasm) → Engine → Service Worker → HTTP URL → <video>
+```
+
+On the web:
+- **libtorrent** runs as WASM with pthreads (Web Workers + `SharedArrayBuffer`)
+- **Networking** uses WebRTC via `datachannel-wasm` (browser-native WebRTC bridge)
+- **Storage** uses Emscripten MEMFS (in-memory filesystem)
+- **Video playback** uses an HTML5 `<video>` element instead of `media_kit`/mpv
+- **HTTP serving** is handled by a Service Worker that intercepts `/seekserve-stream/{id}/{fi}` URLs
+
+### How It Works
+
+1. The WASM module (`seekserve.js` + `seekserve.wasm`) is loaded as a `<script>` tag
+2. A JS glue layer (`seekserve_wasm.js`) wraps all C API functions for Dart via `dart:js_interop`
+3. A byte reader Web Worker (`seekserve_reader.js`) handles blocking `ss_read_bytes()` calls off the main thread
+4. A Service Worker (`seekserve_sw.js`) intercepts fetch requests matching `/seekserve-stream/*`
+5. When the `<video>` element requests a byte range, the Service Worker asks the main thread, which calls into the WASM module, and returns a `206 Partial Content` response
+6. Dart code uses **conditional imports** (`dart.library.js_interop`) to automatically switch between FFI (native) and JS interop (web)
+
+### Prerequisites
+
+- **Docker** — the WASM build uses an Emscripten Docker image (`emscripten/emsdk`)
+- **Flutter** >= 3.19 with web support enabled
+- **Modern browser** with `SharedArrayBuffer` support (Chrome 119+, Firefox 120+)
+
+### Build Steps
+
+#### Step 1: Build the WASM Module (Docker)
+
+```bash
+docker/build-wasm.sh
+```
+
+This uses the `emscripten/emsdk:3.1.56` Docker image to cross-compile the C++ SDK to WebAssembly. Output:
+
+```
+build/wasm/seekserve-capi/
+  seekserve.js          # Emscripten JS loader
+  seekserve.wasm        # Compiled WebAssembly module
+  seekserve.worker.js   # Emscripten pthread worker
+```
+
+#### Step 2: Deploy WASM Artifacts to Flutter App
+
+```bash
+scripts/deploy-wasm-to-app.sh
+```
+
+This copies the WASM build output and JS glue files into `flutter_seekserve_app/web/`:
+
+```
+flutter_seekserve_app/web/
+  seekserve.js           # Emscripten output
+  seekserve.wasm         # WASM binary
+  seekserve.worker.js    # pthread worker
+  seekserve_wasm.js      # JS glue (Dart ↔ WASM bridge)
+  seekserve_reader.js    # Byte reader Web Worker
+  seekserve_sw.js        # Service Worker (HTTP Range proxy)
+```
+
+#### Step 3: Build the Flutter Web App
+
+```bash
+cd flutter_seekserve_app
+flutter build web
+```
+
+#### Step 4: Run in Chrome
+
+```bash
+cd flutter_seekserve_app
+flutter run -d chrome \
+  --web-header=Cross-Origin-Opener-Policy=same-origin \
+  --web-header=Cross-Origin-Embedder-Policy=require-corp
+```
+
+The `COOP/COEP` headers are **required** for `SharedArrayBuffer`, which Emscripten pthreads depend on. These headers are also set as `<meta>` tags in `index.html`, but some browsers require them as actual HTTP headers.
+
+### Conditional Import System
+
+The codebase uses Dart's conditional imports to dispatch between native and web at compile time:
+
+| Package | File | Native | Web |
+|---------|------|--------|-----|
+| `flutter_seekserve` | `seekserve_client.dart` | `client_native.dart` (dart:ffi) | `client_wasm.dart` (dart:js_interop) |
+| `flutter_seekserve_ui` | `ss_video_player.dart` | `ss_video_player_native.dart` (media_kit) | `ss_video_player_web.dart` (HTML5 `<video>`) |
+| `flutter_seekserve_ui` | `ss_seek_controls.dart` | Full media_kit controls | Stub (not available on web) |
+| `flutter_seekserve_ui` | `health_check_*.dart` | `dart:io` HttpClient | No-op (SW always "online") |
+| `flutter_seekserve_app` | `init_*.dart` | MediaKit init + path_provider | No-op + MEMFS config |
+
+Pattern used in each split:
+```dart
+export 'thing_stub.dart'
+    if (dart.library.io) 'thing_native.dart'
+    if (dart.library.js_interop) 'thing_web.dart';
+```
+
+### COOP/COEP Headers
+
+`SharedArrayBuffer` (required by Emscripten pthreads) needs two HTTP headers:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+These are set in `flutter_seekserve_app/web/index.html` as meta tags. When deploying to production, also configure your web server to send these as actual HTTP response headers.
+
+**Note:** COEP `require-corp` means all sub-resources must either be same-origin or include a `Cross-Origin-Resource-Policy` header. This may affect loading third-party resources (CDN images, fonts, etc.).
+
+### Service Worker Details
+
+The Service Worker (`seekserve_sw.js`) acts as a virtual HTTP Range server:
+
+1. Intercepts `fetch` events matching `/seekserve-stream/{torrentId}/{fileIndex}`
+2. Parses the `Range` header (same logic as the C++ `HttpRangeServer`)
+3. Sends a `MessageChannel` request to the main thread window
+4. The main thread delegates to the byte reader Worker, which calls `ss_read_bytes()` on the WASM module
+5. Returns a `Response` with `status: 206`, `Content-Range`, and the requested bytes
+
+Supported responses: `200 OK` (full file), `206 Partial Content` (range request), `HEAD` (size query).
+
+### Quick Reference
+
+| Scenario | Command |
+|----------|---------|
+| Build WASM module | `docker/build-wasm.sh` |
+| Deploy to Flutter web | `scripts/deploy-wasm-to-app.sh` |
+| Build Flutter web app | `cd flutter_seekserve_app && flutter build web` |
+| Run in Chrome (dev) | `flutter run -d chrome --web-header=Cross-Origin-Opener-Policy=same-origin --web-header=Cross-Origin-Embedder-Policy=require-corp` |
+| Run Dart tests on Chrome | `cd flutter_seekserve && flutter test --platform chrome` |
+
+### Current Limitations
+
+- **WebTorrent only** — browser peers connect via WebRTC, not standard TCP BitTorrent
+- **MEMFS storage** — all downloaded data is in memory (lost on page refresh); IDBFS persistence is not yet wired
+- **No `SsSeekControls`** — the `media_kit` `Player` type doesn't exist on web; the HTML5 video player has its own built-in controls
+- **COOP/COEP restrictions** — `SharedArrayBuffer` requires strict cross-origin isolation, which may block some third-party resources
+- **Binary size** — the WASM module is ~10-20 MB; consider lazy loading and `-Oz` optimization for production
 
 ---
 
