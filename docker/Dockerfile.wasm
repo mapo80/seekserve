@@ -1,0 +1,47 @@
+FROM emscripten/emsdk:3.1.56
+
+# Install vcpkg dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl zip unzip tar pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install vcpkg
+RUN git clone https://github.com/microsoft/vcpkg.git /opt/vcpkg \
+    && /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+ENV VCPKG_ROOT=/opt/vcpkg
+
+# Copy source tree
+WORKDIR /src
+COPY . .
+
+# Initialize git submodules (libtorrent + deps)
+RUN git submodule update --init \
+    && cd extern/libtorrent \
+    && git submodule update --init --recursive --force \
+    && cd /src
+
+# Use WASM-specific vcpkg manifest (no boost-beast, no gtest)
+RUN cp /src/vcpkg-wasm.json /src/vcpkg.json
+
+# Configure and build WASM target
+RUN emcmake cmake -S /src -B /src/build/wasm \
+    -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake \
+    -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=/emsdk/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake \
+    -DVCPKG_TARGET_TRIPLET=wasm32-emscripten \
+    -DVCPKG_OVERLAY_TRIPLETS=/src/triplets \
+    -DVCPKG_MANIFEST_DIR=/src \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DSEEKSERVE_BUILD_TESTS=OFF \
+    -DSEEKSERVE_BUILD_DEMO=OFF \
+    -DSEEKSERVE_BUILD_CAPI=ON \
+    -DSEEKSERVE_CAPI_STATIC=ON \
+    -DSEEKSERVE_ENABLE_WEBTORRENT=OFF
+
+RUN cmake --build /src/build/wasm --target seekserve-capi -j$(nproc)
+
+# Output artifacts to /out for extraction
+RUN mkdir -p /out \
+    && cp /src/build/wasm/seekserve-capi/seekserve.js /out/ 2>/dev/null || true \
+    && cp /src/build/wasm/seekserve-capi/seekserve.wasm /out/ 2>/dev/null || true \
+    && cp /src/build/wasm/seekserve-capi/seekserve.worker.js /out/ 2>/dev/null || true

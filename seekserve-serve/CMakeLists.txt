@@ -1,10 +1,15 @@
-add_library(seekserve-serve STATIC
-    src/http_range_server.cpp
-    src/control_api_server.cpp
+set(SERVE_SOURCES
+    src/engine.cpp
     src/range_parser.cpp
     src/token_auth.cpp
-    src/engine.cpp
 )
+if(NOT EMSCRIPTEN)
+    list(APPEND SERVE_SOURCES
+        src/http_range_server.cpp
+        src/control_api_server.cpp
+    )
+endif()
+add_library(seekserve-serve STATIC ${SERVE_SOURCES})
 
 target_include_directories(seekserve-serve
     PUBLIC

@@ -23,8 +23,10 @@
 #include "seekserve/byte_source.hpp"
 #include "seekserve/streaming_scheduler.hpp"
 #include "seekserve/offline_cache.hpp"
+#ifndef __EMSCRIPTEN__
 #include "seekserve/http_range_server.hpp"
 #include "seekserve/control_api_server.hpp"
+#endif
 
 namespace seekserve {
 
@@ -60,6 +62,12 @@ public:
     Result<std::string> get_stream_url(const TorrentId& id, FileIndex fi);
     std::string get_status_json(const TorrentId& id);
 
+    // Direct byte access (used by WASM via Service Worker)
+    Result<std::size_t> read_bytes(const TorrentId& id, FileIndex fi,
+                                    std::uint64_t offset, std::uint64_t length,
+                                    std::uint8_t* out_buf);
+    Result<std::uint64_t> get_file_size(const TorrentId& id, FileIndex fi);
+
     // Server lifecycle
     Result<std::uint16_t> start_server(std::uint16_t port = 0);
     void stop_server();
@@ -93,8 +101,10 @@ private:
     std::unique_ptr<TorrentSessionManager> sessions_;
     MetadataCatalog catalog_;
     std::unique_ptr<OfflineCacheManager> cache_;
+#ifndef __EMSCRIPTEN__
     std::unique_ptr<HttpRangeServer> http_server_;
     std::unique_ptr<ControlApiServer> api_server_;
+#endif
     std::unique_ptr<net::steady_timer> tick_timer_;
 
     std::unordered_map<TorrentId, std::unique_ptr<TorrentState>> states_;

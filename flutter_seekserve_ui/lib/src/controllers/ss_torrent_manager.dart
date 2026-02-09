@@ -51,8 +51,8 @@ class SsTorrentManager extends ChangeNotifier {
   /// Last error message.
   String? get errorMessage => _errorMessage;
 
-  /// Whether the engine is initialised and the server is running.
-  bool get isReady => _client != null && _serverPort != null;
+  /// Whether the engine is initialised and the server is started.
+  bool get isReady => _client != null;
 
   /// Engine start time.
   DateTime? get startedAt => _startedAt;
@@ -86,7 +86,8 @@ class SsTorrentManager extends ChangeNotifier {
             ),
       );
 
-      _serverPort = _client!.startServer();
+      final port = _client!.startServer();
+      _serverPort = port > 0 ? port : null;
       _startedAt = DateTime.now();
       _authToken = (config ?? SeekServeConfig(savePath: savePath)).authToken;
 

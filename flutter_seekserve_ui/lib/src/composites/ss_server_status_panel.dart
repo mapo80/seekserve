@@ -1,11 +1,13 @@
 import 'dart:async';
-import 'dart:io';
 
 import 'package:flutter/widgets.dart';
 
 import '../atoms/ss_badge.dart';
 import '../theme/ss_theme.dart';
 import '../utils/format.dart';
+import 'health_check_stub.dart'
+    if (dart.library.io) 'health_check_native.dart'
+    if (dart.library.js_interop) 'health_check_web.dart';
 
 /// A detailed diagnostic panel showing the state of the SeekServe web server.
 ///
@@ -125,33 +127,13 @@ class _SsServerStatusPanelState extends State<SsServerStatusPanel> {
       if (_isHealthy) setState(() => _isHealthy = false);
       return;
     }
-    final sw = Stopwatch()..start();
-    try {
-      final client = HttpClient()
-        ..connectionTimeout = const Duration(seconds: 3);
-      final uri = Uri.parse(
-        'http://127.0.0.1:${widget.controlPort}/api/torrents',
-      );
-      final request = await client.openUrl('GET', uri);
-      final response = await request.close();
-      await response.drain<void>();
-      client.close();
-      sw.stop();
-      if (!mounted) return;
-      setState(() {
-        _isHealthy = response.statusCode >= 200 && response.statusCode < 400;
-        _latencyMs = sw.elapsedMilliseconds;
-        _lastCheck = DateTime.now();
-      });
-    } catch (_) {
-      sw.stop();
-      if (!mounted) return;
-      setState(() {
-        _isHealthy = false;
-        _latencyMs = sw.elapsedMilliseconds;
-        _lastCheck = DateTime.now();
-      });
-    }
+    final (healthy, latency) = await runHealthCheck(widget.controlPort!);
+    if (!mounted) return;
+    setState(() {
+      _isHealthy = healthy;
+      _latencyMs = latency;
+      _lastCheck = DateTime.now();
+    });
   }
 
   String _maskToken(String? token) {

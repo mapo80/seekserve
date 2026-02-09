@@ -1,284 +1,52 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:developer' as dev;
-import 'dart:ffi';
 
-import 'package:ffi/ffi.dart';
-
-import 'bindings_generated.dart';
-import 'native_library.dart';
-import 'seekserve_exception.dart';
 import 'models/file_info.dart';
 import 'models/torrent_status.dart';
 import 'models/seekserve_config.dart';
 import 'models/seekserve_event.dart';
 
+import 'client_stub.dart'
+    if (dart.library.ffi) 'client_native.dart'
+    if (dart.library.js_interop) 'client_wasm.dart';
+
 /// High-level Dart API for the SeekServe torrent streaming engine.
 ///
-/// Wraps the C API via dart:ffi with proper memory management,
-/// JSON parsing, and async event delivery via Dart [Stream]s.
-class SeekServeClient {
-  final SeekServeBindings _bindings;
-  late final Pointer<SeekServeEngine> _engine;
-  bool _disposed = false;
+/// On native platforms (iOS/Android/desktop), the implementation uses dart:ffi.
+/// On web, it uses dart:js_interop to call the WASM-compiled C API.
+abstract class SeekServeClient {
+  factory SeekServeClient({SeekServeConfig? config}) =>
+      createClient(config: config);
 
-  final StreamController<SeekServeEvent> _eventController =
-      StreamController<SeekServeEvent>.broadcast();
+  /// Stream of events from the engine (metadata, file completions, errors).
+  Stream<SeekServeEvent> get events;
 
-  NativeCallable<ss_event_callback_tFunction>? _nativeCallback;
+  /// Starts the streaming server. Returns the assigned port (0 on web).
+  int startServer({int port = 0});
 
-  /// Creates a new SeekServe engine instance.
-  ///
-  /// Pass [config] to customise save path, ports, auth token, etc.
-  /// If null, the engine uses defaults.
-  SeekServeClient({SeekServeConfig? config})
-      : _bindings = nativeBindings {
-    final configJson = config?.toJsonString() ?? '{}';
-    final configPtr = configJson.toNativeUtf8().cast<Char>();
-    try {
-      _engine = _bindings.ss_engine_create(configPtr);
-      if (_engine == nullptr) {
-        throw const SeekServeException(-1, 'Failed to create engine');
-      }
-    } finally {
-      calloc.free(configPtr);
-    }
-    _setupEventCallback();
-  }
+  /// Stops the streaming server.
+  void stopServer();
 
-  /// Stream of events from the native engine (metadata, file completions, errors).
-  Stream<SeekServeEvent> get events => _eventController.stream;
+  /// Adds a torrent by magnet URI or .torrent file path. Returns the torrent ID.
+  String addTorrent(String uri);
 
-  // ---------------------------------------------------------------------------
-  // Server lifecycle
-  // ---------------------------------------------------------------------------
+  /// Returns the list of active torrent IDs.
+  List<String> listTorrents();
 
-  /// Starts the HTTP streaming server.
-  ///
-  /// Pass [port] = 0 to let the OS pick a free port.
-  /// Returns the assigned port number.
-  int startServer({int port = 0}) {
-    _ensureNotDisposed();
-    final outPort = calloc<Uint16>();
-    try {
-      final err = _bindings.ss_start_server(_engine, port, outPort);
-      checkError(err);
-      return outPort.value;
-    } finally {
-      calloc.free(outPort);
-    }
-  }
+  /// Removes a torrent. Optionally deletes downloaded files.
+  void removeTorrent(String torrentId, {bool deleteFiles = false});
 
-  /// Stops the HTTP streaming server.
-  void stopServer() {
-    _ensureNotDisposed();
-    final err = _bindings.ss_stop_server(_engine);
-    checkError(err);
-  }
+  /// Lists all files in the torrent. Requires metadata.
+  List<FileInfo> listFiles(String torrentId);
 
-  // ---------------------------------------------------------------------------
-  // Torrent management
-  // ---------------------------------------------------------------------------
+  /// Selects a file for streaming.
+  void selectFile(String torrentId, int fileIndex);
 
-  /// Adds a torrent by magnet URI or `.torrent` file path.
-  ///
-  /// Returns the 40-character hex torrent ID.
-  String addTorrent(String uri) {
-    _ensureNotDisposed();
-    final uriPtr = uri.toNativeUtf8().cast<Char>();
-    // Buffer for 40-char hex ID + null terminator
-    final outId = calloc<Char>(64);
-    try {
-      final err = _bindings.ss_add_torrent(_engine, uriPtr, outId, 64);
-      checkError(err);
-      return outId.cast<Utf8>().toDartString();
-    } finally {
-      calloc.free(uriPtr);
-      calloc.free(outId);
-    }
-  }
+  /// Returns the stream URL for a file. On native: HTTP URL. On web: SW-intercepted URL.
+  String getStreamUrl(String torrentId, int fileIndex);
 
-  /// Returns the list of active torrent IDs in the session.
-  List<String> listTorrents() {
-    _ensureNotDisposed();
-    final outJson = calloc<Pointer<Char>>();
-    try {
-      final err = _bindings.ss_list_torrents(_engine, outJson);
-      checkError(err);
-      final jsonStr = outJson.value.cast<Utf8>().toDartString();
-      final decoded = jsonDecode(jsonStr) as List<dynamic>;
-      return decoded.cast<String>();
-    } finally {
-      if (outJson.value != nullptr) {
-        _bindings.ss_free_string(outJson.value);
-      }
-      calloc.free(outJson);
-    }
-  }
+  /// Gets the current status of a torrent.
+  TorrentStatus getStatus(String torrentId);
 
-  /// Removes a torrent. If [deleteFiles] is true, also deletes downloaded data.
-  void removeTorrent(String torrentId, {bool deleteFiles = false}) {
-    _ensureNotDisposed();
-    final idPtr = torrentId.toNativeUtf8().cast<Char>();
-    try {
-      final err = _bindings.ss_remove_torrent(_engine, idPtr, deleteFiles);
-      checkError(err);
-    } finally {
-      calloc.free(idPtr);
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // File operations
-  // ---------------------------------------------------------------------------
-
-  /// Lists all files in the torrent. Requires metadata to be available.
-  List<FileInfo> listFiles(String torrentId) {
-    _ensureNotDisposed();
-    final idPtr = torrentId.toNativeUtf8().cast<Char>();
-    final outJson = calloc<Pointer<Char>>();
-    try {
-      final err = _bindings.ss_list_files(_engine, idPtr, outJson);
-      checkError(err);
-      final jsonStr = outJson.value.cast<Utf8>().toDartString();
-      final decoded = jsonDecode(jsonStr);
-      // C API wraps files in {"files": [...]}.
-      final List<dynamic> list;
-      if (decoded is Map<String, dynamic> && decoded.containsKey('files')) {
-        list = decoded['files'] as List<dynamic>;
-      } else if (decoded is List<dynamic>) {
-        list = decoded;
-      } else {
-        return [];
-      }
-      return list
-          .map((e) => FileInfo.fromJson(e as Map<String, dynamic>))
-          .toList();
-    } finally {
-      if (outJson.value != nullptr) {
-        _bindings.ss_free_string(outJson.value);
-      }
-      calloc.free(outJson);
-      calloc.free(idPtr);
-    }
-  }
-
-  /// Selects a file for streaming. Sets priority for that file and deprioritises others.
-  void selectFile(String torrentId, int fileIndex) {
-    _ensureNotDisposed();
-    final idPtr = torrentId.toNativeUtf8().cast<Char>();
-    try {
-      final err = _bindings.ss_select_file(_engine, idPtr, fileIndex);
-      checkError(err);
-    } finally {
-      calloc.free(idPtr);
-    }
-  }
-
-  /// Returns the HTTP stream URL for a specific file in a torrent.
-  ///
-  /// The URL points to the local HTTP Range server and includes the auth token.
-  String getStreamUrl(String torrentId, int fileIndex) {
-    _ensureNotDisposed();
-    final idPtr = torrentId.toNativeUtf8().cast<Char>();
-    final outUrl = calloc<Pointer<Char>>();
-    try {
-      final err =
-          _bindings.ss_get_stream_url(_engine, idPtr, fileIndex, outUrl);
-      checkError(err);
-      return outUrl.value.cast<Utf8>().toDartString();
-    } finally {
-      if (outUrl.value != nullptr) {
-        _bindings.ss_free_string(outUrl.value);
-      }
-      calloc.free(outUrl);
-      calloc.free(idPtr);
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Status
-  // ---------------------------------------------------------------------------
-
-  /// Gets the current status of a torrent (progress, rates, peers, etc.).
-  TorrentStatus getStatus(String torrentId) {
-    _ensureNotDisposed();
-    final idPtr = torrentId.toNativeUtf8().cast<Char>();
-    final outJson = calloc<Pointer<Char>>();
-    try {
-      final err = _bindings.ss_get_status(_engine, idPtr, outJson);
-      checkError(err);
-      final jsonStr = outJson.value.cast<Utf8>().toDartString();
-      final map = jsonDecode(jsonStr) as Map<String, dynamic>;
-      return TorrentStatus.fromJson(map);
-    } finally {
-      if (outJson.value != nullptr) {
-        _bindings.ss_free_string(outJson.value);
-      }
-      calloc.free(outJson);
-      calloc.free(idPtr);
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Lifecycle
-  // ---------------------------------------------------------------------------
-
-  /// Releases all native resources. Must be called when done.
-  void dispose() {
-    if (_disposed) return;
-    _disposed = true;
-
-    _nativeCallback?.close();
-    _nativeCallback = null;
-    _eventController.close();
-    _bindings.ss_engine_destroy(_engine);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Internals
-  // ---------------------------------------------------------------------------
-
-  void _setupEventCallback() {
-    // NativeCallable.listener dispatches calls from native threads to
-    // the Dart event loop. The closure captures `this` so we can add
-    // events to the stream controller.
-    _nativeCallback = NativeCallable<ss_event_callback_tFunction>.listener(
-      _handleNativeEvent,
-    );
-
-    final err = _bindings.ss_set_event_callback(
-      _engine,
-      _nativeCallback!.nativeFunction,
-      nullptr,
-    );
-    checkError(err);
-  }
-
-  void _handleNativeEvent(Pointer<Char> eventJsonPtr, Pointer<Void> userData) {
-    if (_disposed) return;
-    try {
-      final jsonStr = eventJsonPtr.cast<Utf8>().toDartString();
-      // NOTE: The event string was heap-allocated on the C++ side. Calling
-      // ss_free_string or calloc.free here crashes on iOS (allocator mismatch
-      // between the static lib and the Dart runtime). We intentionally leak
-      // these small strings (~100 bytes each, bounded count) until a proper
-      // ring-buffer or Dart_Port approach replaces NativeCallable.listener.
-      if (jsonStr.isEmpty) return;
-      dev.log('SeekServe event: $jsonStr', name: 'SeekServe');
-      final map = jsonDecode(jsonStr) as Map<String, dynamic>;
-      final event = SeekServeEvent.fromJson(map);
-      _eventController.add(event);
-    } catch (e) {
-      // Log but don't propagate parse errors — they would surface as
-      // error banners in the UI for transient issues.
-      dev.log('SeekServe event parse error: $e', name: 'SeekServe');
-    }
-  }
-
-  void _ensureNotDisposed() {
-    if (_disposed) {
-      throw StateError('SeekServeClient has been disposed');
-    }
-  }
+  /// Releases all resources.
+  void dispose();
 }

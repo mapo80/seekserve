@@ -230,6 +230,29 @@ ss_error_t ss_stop_server(SeekServeEngine* engine) {
     return SS_OK;
 }
 
+ss_error_t ss_read_bytes(SeekServeEngine* engine, const char* torrent_id,
+                          int32_t file_index, uint64_t offset, uint64_t length,
+                          uint8_t* out_buf, uint64_t* out_bytes_read) {
+    if (!engine || !torrent_id || !out_buf || !out_bytes_read) return SS_ERR_INVALID_ARG;
+
+    auto result = engine->read_bytes(torrent_id, file_index, offset, length, out_buf);
+    if (!result) return map_error(result.error());
+
+    *out_bytes_read = result.value();
+    return SS_OK;
+}
+
+ss_error_t ss_get_file_size(SeekServeEngine* engine, const char* torrent_id,
+                             int32_t file_index, uint64_t* out_size) {
+    if (!engine || !torrent_id || !out_size) return SS_ERR_INVALID_ARG;
+
+    auto result = engine->get_file_size(torrent_id, file_index);
+    if (!result) return map_error(result.error());
+
+    *out_size = result.value();
+    return SS_OK;
+}
+
 void ss_free_string(char* str) {
     delete[] str;
 }

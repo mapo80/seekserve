@@ -1,4 +1,12 @@
-import 'bindings_generated.dart';
+// Error codes matching seekserve_c.h defines.
+const int SS_OK = 0;
+const int SS_ERR_INVALID_ARG = -1;
+const int SS_ERR_NOT_FOUND = -2;
+const int SS_ERR_METADATA_PENDING = -3;
+const int SS_ERR_TIMEOUT = -4;
+const int SS_ERR_IO = -5;
+const int SS_ERR_ALREADY_RUNNING = -6;
+const int SS_ERR_CANCELLED = -7;
 
 /// Exception thrown when a SeekServe C API call returns an error.
 class SeekServeException implements Exception {

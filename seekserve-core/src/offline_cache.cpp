@@ -26,7 +26,11 @@ void OfflineCacheManager::init_db() {
         return;
     }
 
+#ifdef __EMSCRIPTEN__
+    sqlite3_exec(db_, "PRAGMA journal_mode=MEMORY;", nullptr, nullptr, nullptr);
+#else
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
+#endif
 
     const char* sql = R"(
         CREATE TABLE IF NOT EXISTS cache_entries (

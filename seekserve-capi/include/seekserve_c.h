@@ -78,6 +78,21 @@ __attribute__((visibility("default")))
 ss_error_t ss_stop_server(SeekServeEngine* engine);
 
 __attribute__((visibility("default")))
+ss_error_t ss_read_bytes(SeekServeEngine* engine,
+                          const char* torrent_id,
+                          int32_t file_index,
+                          uint64_t offset,
+                          uint64_t length,
+                          uint8_t* out_buf,
+                          uint64_t* out_bytes_read);
+
+__attribute__((visibility("default")))
+ss_error_t ss_get_file_size(SeekServeEngine* engine,
+                             const char* torrent_id,
+                             int32_t file_index,
+                             uint64_t* out_size);
+
+__attribute__((visibility("default")))
 void ss_free_string(char* str);
 
 #ifdef __cplusplus

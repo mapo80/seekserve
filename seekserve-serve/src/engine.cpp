@@ -48,8 +48,10 @@ SeekServeEngine::~SeekServeEngine() {
         sessions_->alert_dispatcher().stop();
     }
 
+#ifndef __EMSCRIPTEN__
     api_server_.reset();
     http_server_.reset();
+#endif
     states_.clear();
     cache_.reset();
     // catalog_ and sessions_ destroyed implicitly in member order
@@ -232,6 +234,7 @@ Result<void> SeekServeEngine::select_file(const TorrentId& id, FileIndex fi) {
         config_.scheduler, state->avail, *state->mapper);
 
     // Register byte source on HTTP server if running
+#ifndef __EMSCRIPTEN__
     if (http_server_) {
         http_server_->set_byte_source(state->source, id, fi, file_info.value().path);
 
@@ -243,6 +246,7 @@ Result<void> SeekServeEngine::select_file(const TorrentId& id, FileIndex fi) {
                 sched_ptr->on_range_request(range, handle);
             });
     }
+#endif
 
     {
         std::lock_guard lock(mu_);
@@ -253,13 +257,17 @@ Result<void> SeekServeEngine::select_file(const TorrentId& id, FileIndex fi) {
 }
 
 Result<std::string> SeekServeEngine::get_stream_url(const TorrentId& id, FileIndex fi) {
-    if (!http_server_) {
-        return make_error_code(errc::session_not_started);
-    }
     if (!sessions_->has_torrent(id)) {
         return make_error_code(errc::torrent_not_found);
     }
+#ifdef __EMSCRIPTEN__
+    return "/seekserve-stream/" + id + "/" + std::to_string(fi);
+#else
+    if (!http_server_) {
+        return make_error_code(errc::session_not_started);
+    }
     return http_server_->stream_url(id, fi);
+#endif
 }
 
 std::string SeekServeEngine::get_status_json(const TorrentId& id) {
@@ -309,6 +317,15 @@ Result<std::uint16_t> SeekServeEngine::start_server(std::uint16_t port) {
         return make_error_code(errc::server_already_running);
     }
 
+#ifdef __EMSCRIPTEN__
+    // On WASM: no HTTP servers, just start io_context for tick timer
+    work_guard_ = std::make_unique<work_guard_t>(ioc_.get_executor());
+    io_thread_ = std::thread([this]() { ioc_.run(); });
+    start_tick_timer();
+    server_running_.store(true);
+    spdlog::info("Engine: WASM mode started (no HTTP servers)");
+    return 0;  // no real port on web
+#else
     // Create servers
     http_server_ = std::make_unique<HttpRangeServer>(ioc_, config_.server);
     http_server_->set_auth_token(config_.auth_token);
@@ -343,6 +360,7 @@ Result<std::uint16_t> SeekServeEngine::start_server(std::uint16_t port) {
                  http_server_->port(), api_server_->port());
 
     return api_result.value();
+#endif
 }
 
 void SeekServeEngine::stop_server() {
@@ -353,8 +371,10 @@ void SeekServeEngine::stop_server() {
         tick_timer_.reset();
     }
 
+#ifndef __EMSCRIPTEN__
     if (api_server_) api_server_->stop();
     if (http_server_) http_server_->stop();
+#endif
 
     // Cancel all active ByteSources so in-flight reads unblock immediately
     {
@@ -419,6 +439,41 @@ void SeekServeEngine::on_tick(const boost::system::error_code& ec) {
     tick_timer_->async_wait([this](const boost::system::error_code& ec2) {
         on_tick(ec2);
     });
+}
+
+Result<std::size_t> SeekServeEngine::read_bytes(const TorrentId& id, FileIndex fi,
+                                                 std::uint64_t offset, std::uint64_t length,
+                                                 std::uint8_t* out_buf) {
+    // Grab source pointer under lock, then release — read() blocks on cv_
+    // and piece_finished_alert handler also takes mu_, so holding mu_ here
+    // would deadlock.
+    std::shared_ptr<ByteSource> source;
+    {
+        std::lock_guard lock(mu_);
+        auto* state = find_state(id);
+        if (!state) return make_error_code(errc::torrent_not_found);
+        if (state->selected_file != fi) return make_error_code(errc::file_not_found);
+        if (!state->source) return make_error_code(errc::metadata_not_ready);
+        source = state->source;
+    }
+
+    auto result = source->read(static_cast<std::int64_t>(offset),
+                                static_cast<std::int64_t>(length));
+    if (!result) return result.error();
+
+    const auto& data = result.value();
+    std::memcpy(out_buf, data.data(), data.size());
+    return data.size();
+}
+
+Result<std::uint64_t> SeekServeEngine::get_file_size(const TorrentId& id, FileIndex fi) {
+    std::lock_guard lock(mu_);
+    auto* state = find_state(id);
+    if (!state) return make_error_code(errc::torrent_not_found);
+    if (state->selected_file != fi) return make_error_code(errc::file_not_found);
+    if (!state->source) return make_error_code(errc::metadata_not_ready);
+
+    return static_cast<std::uint64_t>(state->source->file_size());
 }
 
 std::string SeekServeEngine::infohash_to_hex(const lt::info_hash_t& ih) {

@@ -35,11 +35,11 @@ if(SEEKSERVE_BUILD_CAPI)
     add_subdirectory(seekserve-capi)
 endif()
 
-if(SEEKSERVE_BUILD_DEMO)
+if(SEEKSERVE_BUILD_DEMO AND NOT EMSCRIPTEN)
     add_subdirectory(seekserve-demo)
 endif()
 
-if(SEEKSERVE_BUILD_TESTS)
+if(SEEKSERVE_BUILD_TESTS AND NOT EMSCRIPTEN)
     enable_testing()
     add_subdirectory(tests)
 endif()
