@@ -3,6 +3,7 @@
   "version-semver": "0.1.0",
   "dependencies": [
     "boost-asio",
+    "boost-beast",
     "boost-config",
     "boost-crc",
     "boost-date-time",

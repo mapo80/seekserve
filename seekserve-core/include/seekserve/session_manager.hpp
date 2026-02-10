@@ -40,6 +40,16 @@ public:
     lt::session& session() { return *session_; }
     AlertDispatcher& alert_dispatcher() { return dispatcher_; }
 
+    /// Store a handle from an add_torrent_alert (used on Emscripten where
+    /// add_torrent() is non-blocking via async_add_torrent).
+    void store_handle(const lt::torrent_handle& h);
+    void store_handle(const lt::torrent_handle& h, const TorrentId& id);
+
+    /// Reverse lookup: torrent_handle → TorrentId.
+    /// Uses torrent_handle::operator== (weak_ptr comparison, no sync_call).
+    /// Safe to call from any thread including AlertDispatcher on Emscripten.
+    TorrentId id_from_handle(const lt::torrent_handle& h) const;
+
 private:
     static lt::settings_pack make_settings(const SessionConfig& config);
     TorrentId torrent_id_from_handle(const lt::torrent_handle& h) const;

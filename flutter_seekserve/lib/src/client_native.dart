@@ -45,6 +45,9 @@ class SeekServeClientNative implements SeekServeClient {
   }
 
   @override
+  Future<void> initialize() async {}
+
+  @override
   Stream<SeekServeEvent> get events => _eventController.stream;
 
   @override

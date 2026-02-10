@@ -48,6 +48,7 @@ void AlertDispatcher::run(lt::session& ses) {
 
         std::lock_guard lock(mu_);
         for (const auto* alert : alerts) {
+            spdlog::debug("AlertDispatcher: [{}] {}", alert->type(), alert->message());
             auto it = handlers_.find(alert->type());
             if (it != handlers_.end()) {
                 try {

@@ -19,6 +19,7 @@ TorrentSessionManager::TorrentSessionManager(const SessionConfig& config)
     auto sp = make_settings(config);
     session_ = std::make_unique<lt::session>(lt::session_params{sp});
     dispatcher_.start(*session_);
+
     spdlog::info("TorrentSessionManager: session created (save_path={})", config_.save_path);
 }
 
@@ -36,7 +37,11 @@ lt::settings_pack TorrentSessionManager::make_settings(const SessionConfig& conf
         | lt::alert_category::piece_progress
         | lt::alert_category::error
         | lt::alert_category::storage
-        | lt::alert_category::dht);
+        | lt::alert_category::dht
+        | lt::alert_category::peer
+        | lt::alert_category::tracker
+        | lt::alert_category::torrent_log
+        | lt::alert_category::session_log);
 
     sp.set_str(lt::settings_pack::listen_interfaces,
         "0.0.0.0:" + std::to_string(config.listen_port_start) +
@@ -53,8 +58,10 @@ lt::settings_pack TorrentSessionManager::make_settings(const SessionConfig& conf
 
 #ifdef TORRENT_USE_RTC
     if (config.enable_webtorrent) {
-        sp.set_str(lt::settings_pack::webtorrent_stun_server, "stun.l.google.com:19302");
-        spdlog::info("WebTorrent enabled (STUN: stun.l.google.com:19302)");
+        // Browser RTCPeerConnection API requires "stun:" URL scheme prefix.
+        // datachannel-wasm passes the URL as-is to the browser (Dummy IceServer type).
+        sp.set_str(lt::settings_pack::webtorrent_stun_server, "stun:stun.l.google.com:19302");
+        spdlog::info("WebTorrent enabled (STUN: stun:stun.l.google.com:19302)");
     }
 #endif
 
@@ -86,6 +93,20 @@ Result<TorrentId> TorrentSessionManager::add_torrent(const AddTorrentParams& par
         atp.trackers.push_back(tracker);
     }
 
+#ifdef __EMSCRIPTEN__
+    // On Emscripten, use async_add_torrent to avoid blocking the main thread
+    // (which would deadlock with __proxy:'sync' datachannel-wasm calls).
+    auto ih = atp.info_hashes;
+    session_->async_add_torrent(std::move(atp));
+
+    TorrentId id;
+    if (ih.has_v2()) {
+        id = lt::aux::to_hex({ih.v2.data(), static_cast<ptrdiff_t>(ih.v2.size())});
+    } else {
+        id = lt::aux::to_hex({ih.v1.data(), static_cast<ptrdiff_t>(ih.v1.size())});
+    }
+    // Handle stored asynchronously via add_torrent_alert handler in constructor
+#else
     lt::torrent_handle h = session_->add_torrent(std::move(atp));
     auto id = torrent_id_from_handle(h);
 
@@ -93,6 +114,7 @@ Result<TorrentId> TorrentSessionManager::add_torrent(const AddTorrentParams& par
         std::lock_guard lock(mu_);
         handles_[id] = h;
     }
+#endif
 
     spdlog::info("TorrentSessionManager: added torrent {}", id);
     return id;
@@ -140,6 +162,24 @@ std::vector<TorrentId> TorrentSessionManager::list_torrents() const {
     return ids;
 }
 
+void TorrentSessionManager::store_handle(const lt::torrent_handle& h) {
+    // On Emscripten, torrent_id_from_handle() calls h.status() which is a
+    // blocking sync_call to the session thread. When called from the
+    // AlertDispatcher thread this deadlocks. Use info_hashes() from the
+    // handle's internal weak_ptr directly — but that's also a sync_call.
+    // So use the overload with pre-computed id instead.
+    auto id = torrent_id_from_handle(h);
+    std::lock_guard lock(mu_);
+    handles_[id] = h;
+    spdlog::debug("TorrentSessionManager: stored handle for {}", id);
+}
+
+void TorrentSessionManager::store_handle(const lt::torrent_handle& h, const TorrentId& id) {
+    std::lock_guard lock(mu_);
+    handles_[id] = h;
+    spdlog::debug("TorrentSessionManager: stored handle for {}", id);
+}
+
 TorrentId TorrentSessionManager::torrent_id_from_handle(const lt::torrent_handle& h) const {
     auto status = h.status(lt::torrent_handle::query_name);
     auto ih = status.info_hashes;
@@ -147,6 +187,14 @@ TorrentId TorrentSessionManager::torrent_id_from_handle(const lt::torrent_handle
         return lt::aux::to_hex({ih.v2.data(), static_cast<ptrdiff_t>(ih.v2.size())});
     }
     return lt::aux::to_hex({ih.v1.data(), static_cast<ptrdiff_t>(ih.v1.size())});
+}
+
+TorrentId TorrentSessionManager::id_from_handle(const lt::torrent_handle& h) const {
+    std::lock_guard lock(mu_);
+    for (const auto& [id, stored_h] : handles_) {
+        if (stored_h == h) return id;
+    }
+    return {};
 }
 
 } // namespace seekserve

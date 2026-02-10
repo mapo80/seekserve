@@ -28,10 +28,42 @@ class SeekServeClientWasm implements SeekServeClient {
       StreamController<SeekServeEvent>.broadcast();
 
   Timer? _pollTimer;
+  final String _configJson;
 
-  SeekServeClientWasm({SeekServeConfig? config}) {
-    final configJson = config?.toJsonString() ?? '{}';
-    _engine = seekServeWasm.engineCreate(configJson.toJS);
+  SeekServeClientWasm({SeekServeConfig? config})
+      : _configJson = config?.toJsonString() ?? '{}';
+
+  @override
+  Future<void> initialize() async {
+    // SharedArrayBuffer is required for Emscripten pthreads.
+    // It's only available when the page is served with proper COOP/COEP headers.
+    if (!_hasSharedArrayBuffer()) {
+      throw StateError(
+        'SharedArrayBuffer not available. '
+        'The server must send headers: '
+        'Cross-Origin-Opener-Policy: same-origin, '
+        'Cross-Origin-Embedder-Policy: require-corp. '
+        'Use: flutter run -d chrome '
+        '--web-header=Cross-Origin-Opener-Policy=same-origin '
+        '--web-header=Cross-Origin-Embedder-Policy=require-corp',
+      );
+    }
+    try {
+      await seekServeWasm.init(''.toJS).toDart;
+    } catch (e) {
+      throw StateError('WASM module init failed: ${_jsErrorMessage(e)}');
+    }
+    try {
+      _engine = seekServeWasm.engineCreate(_configJson.toJS);
+    } catch (e) {
+      throw StateError('Engine create failed: ${_jsErrorMessage(e)}');
+    }
+    if (_engine.toDartInt == 0) {
+      throw StateError(
+        'Engine creation returned null. '
+        'Check browser console (F12) for C++ errors.',
+      );
+    }
   }
 
   @override
@@ -40,8 +72,10 @@ class SeekServeClientWasm implements SeekServeClient {
   @override
   int startServer({int port = 0}) {
     _ensureNotDisposed();
-    final result =
-        seekServeWasm.startServer(_engine, port.toJS) as JsPortResult;
+    final result = _jsCall(
+      () => seekServeWasm.startServer(_engine, port.toJS) as JsPortResult,
+      'startServer',
+    );
     final err = result.error.toDartInt;
     checkError(err);
 
@@ -65,15 +99,20 @@ class SeekServeClientWasm implements SeekServeClient {
     _ensureNotDisposed();
     _pollTimer?.cancel();
     _pollTimer = null;
-    final err = seekServeWasm.stopServer(_engine);
+    final err = _jsCall(
+      () => seekServeWasm.stopServer(_engine),
+      'stopServer',
+    );
     checkError(err.toDartInt);
   }
 
   @override
   String addTorrent(String uri) {
     _ensureNotDisposed();
-    final result =
-        seekServeWasm.addTorrent(_engine, uri.toJS) as JsStringResult;
+    final result = _jsCall(
+      () => seekServeWasm.addTorrent(_engine, uri.toJS) as JsStringResult,
+      'addTorrent',
+    );
     final err = result.error.toDartInt;
     checkError(err);
     return result.id!.toDart;
@@ -82,7 +121,10 @@ class SeekServeClientWasm implements SeekServeClient {
   @override
   List<String> listTorrents() {
     _ensureNotDisposed();
-    final result = seekServeWasm.listTorrents(_engine) as JsStringResult;
+    final result = _jsCall(
+      () => seekServeWasm.listTorrents(_engine) as JsStringResult,
+      'listTorrents',
+    );
     final err = result.error.toDartInt;
     checkError(err);
     final jsonStr = result.json?.toDart;
@@ -94,16 +136,22 @@ class SeekServeClientWasm implements SeekServeClient {
   @override
   void removeTorrent(String torrentId, {bool deleteFiles = false}) {
     _ensureNotDisposed();
-    final err = seekServeWasm.removeTorrent(
-        _engine, torrentId.toJS, deleteFiles.toJS);
+    final err = _jsCall(
+      () => seekServeWasm.removeTorrent(
+          _engine, torrentId.toJS, deleteFiles.toJS),
+      'removeTorrent',
+    );
     checkError(err.toDartInt);
   }
 
   @override
   List<FileInfo> listFiles(String torrentId) {
     _ensureNotDisposed();
-    final result =
-        seekServeWasm.listFiles(_engine, torrentId.toJS) as JsStringResult;
+    final result = _jsCall(
+      () =>
+          seekServeWasm.listFiles(_engine, torrentId.toJS) as JsStringResult,
+      'listFiles',
+    );
     final err = result.error.toDartInt;
     checkError(err);
     final jsonStr = result.json?.toDart;
@@ -125,16 +173,22 @@ class SeekServeClientWasm implements SeekServeClient {
   @override
   void selectFile(String torrentId, int fileIndex) {
     _ensureNotDisposed();
-    final err =
-        seekServeWasm.selectFile(_engine, torrentId.toJS, fileIndex.toJS);
+    final err = _jsCall(
+      () =>
+          seekServeWasm.selectFile(_engine, torrentId.toJS, fileIndex.toJS),
+      'selectFile',
+    );
     checkError(err.toDartInt);
   }
 
   @override
   String getStreamUrl(String torrentId, int fileIndex) {
     _ensureNotDisposed();
-    final result = seekServeWasm.getStreamUrl(
-        _engine, torrentId.toJS, fileIndex.toJS) as JsStringResult;
+    final result = _jsCall(
+      () => seekServeWasm.getStreamUrl(
+          _engine, torrentId.toJS, fileIndex.toJS) as JsStringResult,
+      'getStreamUrl',
+    );
     final err = result.error.toDartInt;
     checkError(err);
     return result.url!.toDart;
@@ -143,8 +197,11 @@ class SeekServeClientWasm implements SeekServeClient {
   @override
   TorrentStatus getStatus(String torrentId) {
     _ensureNotDisposed();
-    final result =
-        seekServeWasm.getStatus(_engine, torrentId.toJS) as JsStringResult;
+    final result = _jsCall(
+      () =>
+          seekServeWasm.getStatus(_engine, torrentId.toJS) as JsStringResult,
+      'getStatus',
+    );
     final err = result.error.toDartInt;
     checkError(err);
     final jsonStr = result.json!.toDart;
@@ -159,7 +216,9 @@ class SeekServeClientWasm implements SeekServeClient {
     _pollTimer?.cancel();
     _pollTimer = null;
     _eventController.close();
-    seekServeWasm.engineDestroy(_engine);
+    try {
+      seekServeWasm.engineDestroy(_engine);
+    } catch (_) {}
   }
 
   void _registerServiceWorker() {
@@ -248,5 +307,43 @@ class SeekServeClientWasm implements SeekServeClient {
     if (_disposed) {
       throw StateError('SeekServeClient has been disposed');
     }
+  }
+
+  // --- Helpers ---
+
+  static bool _hasSharedArrayBuffer() {
+    final sab = globalContext.getProperty<JSAny?>('SharedArrayBuffer'.toJS);
+    return sab != null && sab.isA<JSFunction>();
+  }
+
+  /// Wrap a JS interop call so that JS exceptions become readable Dart errors.
+  static T _jsCall<T>(T Function() fn, String context) {
+    try {
+      return fn();
+    } catch (e) {
+      throw StateError('WASM $context: ${_jsErrorMessage(e)}');
+    }
+  }
+
+  /// Extract a human-readable message from a JS error object.
+  static String _jsErrorMessage(Object e) {
+    try {
+      final jsVal = e.jsify();
+      if (jsVal != null && jsVal.isA<JSObject>()) {
+        final obj = jsVal as JSObject;
+        // Try .message (Error objects)
+        final msg = obj.getProperty<JSAny?>('message'.toJS);
+        if (msg != null && msg.isA<JSString>()) {
+          return (msg as JSString).toDart;
+        }
+        // Try .toString()
+        final str = obj.callMethod<JSAny?>('toString'.toJS);
+        if (str != null && str.isA<JSString>()) {
+          final s = (str as JSString).toDart;
+          if (s != '[object Object]') return s;
+        }
+      }
+    } catch (_) {}
+    return '$e';
   }
 }

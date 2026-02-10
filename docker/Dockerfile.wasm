@@ -30,7 +30,8 @@ ENV CFLAGS="-pthread" CXXFLAGS="-pthread"
 RUN /opt/vcpkg/vcpkg install \
     --overlay-triplets=/src/triplets \
     --triplet=wasm32-emscripten \
-    --x-install-root=/opt/vcpkg-wasm
+    --x-install-root=/opt/vcpkg-wasm \
+    --allow-unsupported
 
 # ============================================================
 # Stage 3: build — copy source, init submodules, compile
@@ -48,6 +49,602 @@ RUN cp /src/vcpkg-wasm.json /src/vcpkg.json
 RUN git submodule update --init \
     && cd extern/libtorrent \
     && git submodule update --init --recursive --force
+
+# Copy datachannel-wasm into libtorrent deps for Emscripten WebRTC support.
+# datachannel-wasm provides the same rtc/*.hpp API as libdatachannel but uses
+# the browser's native WebRTC instead of libjuice/usrsctp (which need UDP sockets).
+RUN cp -r /src/extern/datachannel-wasm /src/extern/libtorrent/deps/datachannel-wasm
+
+# Patch libtorrent CMakeLists.txt for Emscripten + datachannel-wasm.
+# On Emscripten, swap libdatachannel for datachannel-wasm and guard
+# native-only includes/targets that don't exist on WASM.
+RUN python3 <<'PYEOF'
+import re
+
+path = '/src/extern/libtorrent/CMakeLists.txt'
+with open(path) as f:
+    content = f.read()
+
+# Patch 1: Replace add_subdirectory(deps/libdatachannel) + set_target_properties
+#           with conditional: Emscripten uses datachannel-wasm, native uses libdatachannel.
+content = content.replace(
+    '\tadd_subdirectory(deps/libdatachannel EXCLUDE_FROM_ALL)\n'
+    '\tset_target_properties(datachannel-static PROPERTIES POSITION_INDEPENDENT_CODE ON)',
+    '\tif(EMSCRIPTEN)\n'
+    '\t\tadd_subdirectory(deps/datachannel-wasm EXCLUDE_FROM_ALL)\n'
+    '\t\tadd_library(datachannel-static ALIAS datachannel-wasm)\n'
+    '\telse()\n'
+    '\t\tadd_subdirectory(deps/libdatachannel EXCLUDE_FROM_ALL)\n'
+    '\t\tset_target_properties(datachannel-static PROPERTIES POSITION_INDEPENDENT_CODE ON)\n'
+    '\tendif()')
+
+# Patch 2: Guard compile options for datachannel-static (can't set on ALIAS).
+content = content.replace(
+    '\tif(CMAKE_CXX_COMPILER_ID MATCHES Clang|GNU)\n'
+    '\t\ttarget_compile_options(datachannel-static PRIVATE\n'
+    '\t\t\t-Wno-pedantic\n'
+    '\t\t\t-Wno-unused-parameter\n'
+    '\t\t\t-Wno-unused-variable)\n'
+    '\tendif()',
+    '\tif(NOT EMSCRIPTEN)\n'
+    '\t\tif(CMAKE_CXX_COMPILER_ID MATCHES Clang|GNU)\n'
+    '\t\t\ttarget_compile_options(datachannel-static PRIVATE\n'
+    '\t\t\t\t-Wno-pedantic\n'
+    '\t\t\t\t-Wno-unused-parameter\n'
+    '\t\t\t\t-Wno-unused-variable)\n'
+    '\t\tendif()\n'
+    '\tendif()')
+
+# Patch 3: Guard usrsctp include dirs (don't exist on WASM).
+content = content.replace(
+    '    set(USRSCTP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/libdatachannel/deps/usrsctp/usrsctplib")\n'
+    '    target_include_directories(datachannel-static PRIVATE "${USRSCTP_INCLUDE_DIR}")\n'
+    '    target_include_directories(torrent-rasterbar PRIVATE "${USRSCTP_INCLUDE_DIR}")',
+    '    if(NOT EMSCRIPTEN)\n'
+    '        set(USRSCTP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/libdatachannel/deps/usrsctp/usrsctplib")\n'
+    '        target_include_directories(datachannel-static PRIVATE "${USRSCTP_INCLUDE_DIR}")\n'
+    '        target_include_directories(torrent-rasterbar PRIVATE "${USRSCTP_INCLUDE_DIR}")\n'
+    '    endif()')
+
+# Patch 4: Guard libdatachannel include paths (datachannel-wasm provides its own via PUBLIC).
+content = content.replace(
+    '    target_include_directories(torrent-rasterbar PRIVATE\n'
+    '        deps/libdatachannel/include\n'
+    '        deps/libdatachannel/include/rtc\n'
+    '    )',
+    '    if(NOT EMSCRIPTEN)\n'
+    '        target_include_directories(torrent-rasterbar PRIVATE\n'
+    '            deps/libdatachannel/include\n'
+    '            deps/libdatachannel/include/rtc\n'
+    '        )\n'
+    '    endif()')
+
+# Patch 5: Skip the entire install/export section on Emscripten.
+# datachannel-wasm has absolute source paths in INTERFACE_INCLUDE_DIRECTORIES
+# which CMake rejects in export sets. We don't need install for WASM anyway.
+content = content.replace(
+    'set(LIBTORRENT_EXPORT_TARGETS torrent-rasterbar)',
+    'if(NOT EMSCRIPTEN)\nset(LIBTORRENT_EXPORT_TARGETS torrent-rasterbar)')
+
+# Close the if(NOT EMSCRIPTEN) after the last install() in the export section.
+# The section ends with: install(FILES ...FindLibtorrentRasterbar.cmake ... DESTINATION ...)
+content = content.replace(
+    '\t\t${CMAKE_INSTALL_DATADIR}/cmake/Modules\n)',
+    '\t\t${CMAKE_INSTALL_DATADIR}/cmake/Modules\n)\nendif() # NOT EMSCRIPTEN')
+
+with open(path, 'w') as f:
+    f.write(content)
+
+print("Patched libtorrent CMakeLists.txt for Emscripten + datachannel-wasm")
+PYEOF
+
+# Patch libtorrent rtc_stream.cpp for datachannel-wasm API subset.
+# datachannel-wasm is missing: onAvailable, availableAmount, maxMessageSize,
+# receive, sendBuffer (DataChannel) and remoteAddress, localAddress (PeerConnection).
+# Adapt from libdatachannel's pull model (onAvailable+receive) to
+# datachannel-wasm's push model (onMessage callback) with #ifdef __EMSCRIPTEN__.
+RUN python3 <<'PYEOF'
+path = '/src/extern/libtorrent/src/rtc_stream.cpp'
+with open(path) as f:
+    content = f.read()
+
+# Patch 1: Replace onAvailable with onMessage (push model).
+# datachannel-wasm has no onAvailable/receive — use onMessage to buffer into m_incoming.
+content = content.replace(
+    '\tm_data_channel->onAvailable([this, weak_this]()\n'
+    '\t{\n'
+    '\t\t// Warning: this is called from another thread\n'
+    '\t\tauto self = weak_this.lock();\n'
+    '\t\tif (!self) return;\n'
+    '\n'
+    '\t\tpost(m_io_context, std::bind(&rtc_stream_impl::on_available\n'
+    '\t\t\t, std::move(self)\n'
+    '\t\t\t, error_code{}\n'
+    '\t\t));\n'
+    '\t});',
+    '#ifdef __EMSCRIPTEN__\n'
+    '\t// datachannel-wasm: push model via onMessage (no onAvailable/receive)\n'
+    '\tm_data_channel->onMessage([this, weak_this](rtc::message_variant data) {\n'
+    '\t\tauto self = weak_this.lock();\n'
+    '\t\tif (!self) return;\n'
+    '\t\tstd::visit(rtc::overloaded{\n'
+    '\t\t\t[this](rtc::binary const& bin) {\n'
+    '\t\t\t\tchar const* ptr = reinterpret_cast<char const*>(bin.data());\n'
+    '\t\t\t\tm_incoming.insert(m_incoming.end(), ptr, ptr + bin.size());\n'
+    '\t\t\t},\n'
+    '\t\t\t[](rtc::string const&) { /* ignore string messages */ }\n'
+    '\t\t}, data);\n'
+    '\t\tpost(m_io_context, std::bind(&rtc_stream_impl::on_available\n'
+    '\t\t\t, std::move(self)\n'
+    '\t\t\t, error_code{}\n'
+    '\t\t));\n'
+    '\t});\n'
+    '#else\n'
+    '\tm_data_channel->onAvailable([this, weak_this]()\n'
+    '\t{\n'
+    '\t\t// Warning: this is called from another thread\n'
+    '\t\tauto self = weak_this.lock();\n'
+    '\t\tif (!self) return;\n'
+    '\n'
+    '\t\tpost(m_io_context, std::bind(&rtc_stream_impl::on_available\n'
+    '\t\t\t, std::move(self)\n'
+    '\t\t\t, error_code{}\n'
+    '\t\t));\n'
+    '\t});\n'
+    '#endif')
+
+# Patch 2: availableAmount() — on Emscripten, all data is in m_incoming.
+content = content.replace(
+    'return m_incoming.size() + (m_data_channel ? m_data_channel->availableAmount() : 0);',
+    '#ifdef __EMSCRIPTEN__\n'
+    '\treturn m_incoming.size();\n'
+    '#else\n'
+    '\treturn m_incoming.size() + (m_data_channel ? m_data_channel->availableAmount() : 0);\n'
+    '#endif')
+
+# Patch 2b: Add <atomic> include for synthetic endpoint counter.
+# Unconditional — this Docker build targets Emscripten only.
+content = content.replace(
+    '#include "libtorrent/config.hpp"\n\n#if TORRENT_USE_RTC\n',
+    '#include "libtorrent/config.hpp"\n\n#if TORRENT_USE_RTC\n\n'
+    '#include <atomic>\n'
+    '#include <cstdint>\n')
+
+# Patch 3: remoteAddress() — not available in datachannel-wasm.
+# Return a synthetic endpoint so torrent::on_rtc_stream() can create the peer.
+# Each RTC connection gets a unique port for peer deduplication.
+# Unconditional replacement — this Docker build targets Emscripten only.
+content = content.replace(
+    '\tauto const addr = m_peer_connection->remoteAddress();\n'
+    '\tif (!addr)\n'
+    '\t{\n'
+    '\t\tec = boost::asio::error::operation_not_supported;\n'
+    '\t\treturn {};\n'
+    '\t}\n'
+    '\n'
+    '\treturn rtc_parse_endpoint(*addr, ec);',
+    '\t// WASM: datachannel-wasm has no remoteAddress(). Return synthetic endpoint\n'
+    '\t// with unique port so libtorrent can distinguish peers.\n'
+    '\tstatic std::atomic<std::uint16_t> s_next_port{10000};\n'
+    '\tauto port = s_next_port.fetch_add(1, std::memory_order_relaxed);\n'
+    '\treturn endpoint_type(boost::asio::ip::address_v4::loopback(), port);')
+
+# Patch 4: localAddress() — not available in datachannel-wasm.
+# Return a synthetic local endpoint. Unconditional for same reason.
+content = content.replace(
+    '\tauto addr = m_peer_connection->localAddress();\n'
+    '\tif (!addr)\n'
+    '\t{\n'
+    '\t\tec = boost::asio::error::operation_not_supported;\n'
+    '\t\treturn {};\n'
+    '\t}\n'
+    '\n'
+    '\treturn rtc_parse_endpoint(*addr, ec);',
+    '\t// WASM: datachannel-wasm has no localAddress(). Return loopback:6881.\n'
+    '\treturn endpoint_type(boost::asio::ip::address_v4::loopback(), 6881);')
+
+# Patch 5: maxMessageSize() → constant 65536 on Emscripten.
+# This appears twice in the file (issue_write and write_some).
+content = content.replace(
+    '\tstd::size_t const max_message_size = m_data_channel->maxMessageSize();',
+    '#ifdef __EMSCRIPTEN__\n'
+    '\tstd::size_t const max_message_size = 65536;\n'
+    '#else\n'
+    '\tstd::size_t const max_message_size = m_data_channel->maxMessageSize();\n'
+    '#endif')
+
+# Patch 6: receive() loop — on Emscripten, data is already in m_incoming from onMessage.
+content = content.replace(
+    '\twhile (!m_read_buffer.empty() && m_incoming.empty() && !ec)\n'
+    '\t{\n'
+    '\t\tauto message = m_data_channel->receive();\n'
+    '\t\tif (!message) break;\n'
+    '\n'
+    '\t\tstd::visit(rtc::overloaded\n'
+    '\t\t{\n'
+    '\t\t\t[&](rtc::binary const& bin)\n'
+    '\t\t\t{\n'
+    '\t\t\t\tchar const *data = reinterpret_cast<char const*>(bin.data());\n'
+    '\t\t\t\tstd::size_t const size = bin.size();\n'
+    '\t\t\t\tstd::size_t const copied = incoming_data(span<char const>{data, long(size)});\n'
+    '\t\t\t\tbytes_read += copied;\n'
+    '\t\t\t\tif (copied < size)\n'
+    '\t\t\t\t\tm_incoming.assign(data + copied, data + size);\n'
+    '\t\t\t},\n'
+    '\t\t\t[&](rtc::string const&)\n'
+    '\t\t\t{\n'
+    '\t\t\t\tec = errc::make_error_code(errc::bad_message);\n'
+    '\t\t\t}\n'
+    '\t\t}\n'
+    '\t\t, *message);\n'
+    '\t}',
+    '#ifndef __EMSCRIPTEN__\n'
+    '\t// Native only: pull remaining data from channel via receive()\n'
+    '\twhile (!m_read_buffer.empty() && m_incoming.empty() && !ec)\n'
+    '\t{\n'
+    '\t\tauto message = m_data_channel->receive();\n'
+    '\t\tif (!message) break;\n'
+    '\n'
+    '\t\tstd::visit(rtc::overloaded\n'
+    '\t\t{\n'
+    '\t\t\t[&](rtc::binary const& bin)\n'
+    '\t\t\t{\n'
+    '\t\t\t\tchar const *data = reinterpret_cast<char const*>(bin.data());\n'
+    '\t\t\t\tstd::size_t const size = bin.size();\n'
+    '\t\t\t\tstd::size_t const copied = incoming_data(span<char const>{data, long(size)});\n'
+    '\t\t\t\tbytes_read += copied;\n'
+    '\t\t\t\tif (copied < size)\n'
+    '\t\t\t\t\tm_incoming.assign(data + copied, data + size);\n'
+    '\t\t\t},\n'
+    '\t\t\t[&](rtc::string const&)\n'
+    '\t\t\t{\n'
+    '\t\t\t\tec = errc::make_error_code(errc::bad_message);\n'
+    '\t\t\t}\n'
+    '\t\t}\n'
+    '\t\t, *message);\n'
+    '\t}\n'
+    '#endif')
+
+# Patch 7: sendBuffer() → flatten const_buffers + send() on Emscripten.
+content = content.replace(
+    '\tbool is_buffered = !m_data_channel->sendBuffer(m_write_buffer.begin(), target);',
+    '#ifdef __EMSCRIPTEN__\n'
+    '\t// datachannel-wasm: no sendBuffer(), flatten buffers and send()\n'
+    '\trtc::binary blob;\n'
+    '\tfor (auto it = m_write_buffer.begin(); it != target; ++it) {\n'
+    '\t\tauto const* ptr = reinterpret_cast<rtc::byte const*>(it->data());\n'
+    '\t\tblob.insert(blob.end(), ptr, ptr + it->size());\n'
+    '\t}\n'
+    '\tbool is_buffered = !m_data_channel->send(blob.data(), blob.size());\n'
+    '#else\n'
+    '\tbool is_buffered = !m_data_channel->sendBuffer(m_write_buffer.begin(), target);\n'
+    '#endif')
+
+with open(path, 'w') as f:
+    f.write(content)
+
+# Verify synthetic endpoint patch was applied
+assert 's_next_port' in content, "ERROR: synthetic endpoint patch was NOT applied to rtc_stream.cpp!"
+assert 'm_peer_connection->remoteAddress()' not in content, "ERROR: remoteAddress() call still present — patch 3 failed!"
+print("Patched rtc_stream.cpp for Emscripten (datachannel-wasm API subset)")
+print("  - Verified: synthetic endpoint (s_next_port) present")
+print("  - Verified: remoteAddress() call replaced")
+PYEOF
+
+# datachannel-wasm pthread compatibility.
+# The datachannel-wasm JS library functions (websocket.js, webrtc.js) use
+# `window.WebSocket` and `window.RTCPeerConnection`, which are NOT available
+# in Web Workers (pthreads). Since we build with -sPROXY_TO_PTHREAD, all C++
+# code (including libtorrent's session thread) runs on pthreads.
+# Fix: add __proxy:'sync' annotations so Emscripten proxies these calls to
+# the main browser thread, and replace `window.X` with `typeof X !== 'undefined'`.
+RUN python3 <<'PYEOF'
+import re
+
+# --- Patch websocket.js ---
+# Patch the COPY in libtorrent/deps/ (the build uses this, not the original)
+path = '/src/extern/libtorrent/deps/datachannel-wasm/wasm/js/websocket.js'
+with open(path) as f:
+    content = f.read()
+
+# Fix: window.WebSocket → typeof WebSocket check (works in both main thread and Workers)
+content = content.replace(
+    "if(!window.WebSocket) return 0;",
+    "if(typeof WebSocket === 'undefined') return 0;")
+
+# Add __proxy:'sync' for all ws* functions so they run on the main thread.
+# Pattern: insert "wsXxx__proxy: 'sync'," before each "wsXxx: function"
+ws_funcs = [
+    'wsCreateWebSocket', 'wsDeleteWebSocket', 'wsSetOpenCallback',
+    'wsSetErrorCallback', 'wsSetMessageCallback', 'wsSendMessage',
+    'wsGetWebSocketUrl', 'wsGetWebSocketState', 'wsSetUserPointer',
+]
+for fn in ws_funcs:
+    content = content.replace(
+        fn + ': function',
+        fn + "__proxy: 'sync',\n\t\t" + fn + ': function')
+
+with open(path, 'w') as f:
+    f.write(content)
+print("Patched websocket.js (__proxy:'sync' + window fix)")
+
+# --- Patch webrtc.js ---
+# Patch the COPY in libtorrent/deps/ (the build uses this, not the original)
+path = '/src/extern/libtorrent/deps/datachannel-wasm/wasm/js/webrtc.js'
+with open(path) as f:
+    content = f.read()
+
+# Fix: window.RTCPeerConnection → typeof check
+content = content.replace(
+    "if(!window.RTCPeerConnection) return 0;",
+    "if(typeof RTCPeerConnection === 'undefined') return 0;")
+
+# Add __proxy:'sync' for all rtc* functions
+rtc_funcs = [
+    'rtcCreatePeerConnection', 'rtcDeletePeerConnection',
+    'rtcGetLocalDescription', 'rtcGetLocalDescriptionType',
+    'rtcGetRemoteDescription', 'rtcGetRemoteDescriptionType',
+    'rtcCreateDataChannel', 'rtcDeleteDataChannel',
+    'rtcSetDataChannelCallback', 'rtcSetLocalDescriptionCallback',
+    'rtcSetLocalCandidateCallback', 'rtcSetStateChangeCallback',
+    'rtcSetIceStateChangeCallback', 'rtcSetGatheringStateChangeCallback',
+    'rtcSetSignalingStateChangeCallback', 'rtcSetRemoteDescription',
+    'rtcAddRemoteCandidate', 'rtcCloseDataChannel',
+    'rtcGetDataChannelLabel', 'rtcGetDataChannelUnordered',
+    'rtcGetDataChannelMaxPacketLifeTime', 'rtcGetDataChannelMaxRetransmits',
+    'rtcSetOpenCallback', 'rtcSetErrorCallback', 'rtcSetMessageCallback',
+    'rtcSetBufferedAmountLowCallback', 'rtcGetBufferedAmount',
+    'rtcSetBufferedAmountLowThreshold', 'rtcSendMessage', 'rtcSetUserPointer',
+]
+for fn in rtc_funcs:
+    content = content.replace(
+        fn + ': function',
+        fn + "__proxy: 'sync',\n\t\t" + fn + ': function')
+
+with open(path, 'w') as f:
+    f.write(content)
+print("Patched webrtc.js (__proxy:'sync' + window fix)")
+PYEOF
+
+# WebSocket tracker bridge for Emscripten.
+# Instead of fully excluding the WebSocket tracker, we:
+# 1. Copy wasm_websocket_tracker_connection (uses rtc::WebSocket from datachannel-wasm)
+# 2. Surgically patch tracker_manager to dispatch ws:// to the WASM class on Emscripten
+# 3. Keep parse_websocket_tracker_response() available (un-stub only the class methods)
+# 4. Stub websocket_stream.cpp (Beast transport — not needed on WASM)
+
+# Copy WASM WebSocket tracker files into libtorrent source tree
+RUN cp /src/wasm-patches/wasm_websocket_tracker_connection.hpp \
+       /src/extern/libtorrent/include/libtorrent/aux_/ \
+    && cp /src/wasm-patches/wasm_websocket_tracker_connection.cpp \
+       /src/extern/libtorrent/src/
+
+RUN python3 <<'PYEOF'
+# --- Add wasm_websocket_tracker_connection.cpp to libtorrent source list ---
+path = '/src/extern/libtorrent/CMakeLists.txt'
+with open(path) as f:
+    content = f.read()
+content = content.replace(
+    '\twebsocket_tracker_connection.cpp\n',
+    '\twebsocket_tracker_connection.cpp\n'
+    '\twasm_websocket_tracker_connection.cpp\n')
+with open(path, 'w') as f:
+    f.write(content)
+print("Added wasm_websocket_tracker_connection.cpp to CMakeLists.txt")
+
+# --- Surgically patch tracker_manager.cpp ---
+# Replace blanket exclusion with conditional dispatch per block.
+path = '/src/extern/libtorrent/src/tracker_manager.cpp'
+with open(path) as f:
+    content = f.read()
+
+# Block 1: Include — conditionally include WASM vs native header
+content = content.replace(
+    '#if TORRENT_USE_RTC\n'
+    '#include "libtorrent/aux_/websocket_tracker_connection.hpp"\n'
+    '#endif',
+    '#if TORRENT_USE_RTC\n'
+    '#  ifdef __EMSCRIPTEN__\n'
+    '#    include "libtorrent/aux_/wasm_websocket_tracker_connection.hpp"\n'
+    '#  else\n'
+    '#    include "libtorrent/aux_/websocket_tracker_connection.hpp"\n'
+    '#  endif\n'
+    '#endif')
+
+# Block 2: remove_request — conditional class type
+content = content.replace(
+    '#if TORRENT_USE_RTC\n'
+    '\tvoid tracker_manager::remove_request(aux::websocket_tracker_connection const* c)\n'
+    '\t{\n'
+    '\t\tTORRENT_ASSERT(is_single_thread());\n'
+    '\t\ttracker_request const& req = c->tracker_req();\n'
+    '\t\tm_websocket_conns.erase(req.url);\n'
+    '\t}\n'
+    '#endif',
+    '#if TORRENT_USE_RTC\n'
+    '#  ifdef __EMSCRIPTEN__\n'
+    '\tvoid tracker_manager::remove_request(aux::wasm_websocket_tracker_connection const* c)\n'
+    '#  else\n'
+    '\tvoid tracker_manager::remove_request(aux::websocket_tracker_connection const* c)\n'
+    '#  endif\n'
+    '\t{\n'
+    '\t\tTORRENT_ASSERT(is_single_thread());\n'
+    '\t\ttracker_request const& req = c->tracker_req();\n'
+    '\t\tm_websocket_conns.erase(req.url);\n'
+    '\t}\n'
+    '#endif')
+
+# Block 3: ws/wss dispatch — conditional class instantiation
+# Indentation: 5 tabs for auto con, 7 tabs for ios (inside lambda inside else block)
+content = content.replace(
+    '\t\t\t\t\tauto con = std::make_shared<aux::websocket_tracker_connection>(\n'
+    '\t\t\t\t\t\t\tios, *this, std::move(request), c);',
+    '#ifdef __EMSCRIPTEN__\n'
+    '\t\t\t\t\tauto con = std::make_shared<aux::wasm_websocket_tracker_connection>(\n'
+    '\t\t\t\t\t\t\tios, *this, std::move(request), c);\n'
+    '#else\n'
+    '\t\t\t\t\tauto con = std::make_shared<aux::websocket_tracker_connection>(\n'
+    '\t\t\t\t\t\t\tios, *this, std::move(request), c);\n'
+    '#endif')
+
+# Block 4: abort — conditional vector type
+content = content.replace(
+    '\t\tstd::vector<std::shared_ptr<aux::websocket_tracker_connection>> close_websocket_connections;',
+    '#  ifdef __EMSCRIPTEN__\n'
+    '\t\tstd::vector<std::shared_ptr<aux::wasm_websocket_tracker_connection>> close_websocket_connections;\n'
+    '#  else\n'
+    '\t\tstd::vector<std::shared_ptr<aux::websocket_tracker_connection>> close_websocket_connections;\n'
+    '#  endif')
+
+# Blocks 5-7 (close loop, empty, num_requests) just use m_websocket_conns — no changes needed.
+
+with open(path, 'w') as f:
+    f.write(content)
+print("Patched tracker_manager.cpp (surgical)")
+
+# --- Surgically patch tracker_manager.hpp ---
+path = '/src/extern/libtorrent/include/libtorrent/aux_/tracker_manager.hpp'
+with open(path) as f:
+    content = f.read()
+
+# Forward declaration — conditional class type
+content = content.replace(
+    '#if TORRENT_USE_RTC\n'
+    '\tstruct websocket_tracker_connection;\n'
+    '#endif',
+    '#if TORRENT_USE_RTC\n'
+    '#  ifdef __EMSCRIPTEN__\n'
+    '\tstruct wasm_websocket_tracker_connection;\n'
+    '#  else\n'
+    '\tstruct websocket_tracker_connection;\n'
+    '#  endif\n'
+    '#endif')
+
+# remove_request overload — conditional class type
+content = content.replace(
+    '#if TORRENT_USE_RTC\n'
+    '\t\tvoid remove_request(aux::websocket_tracker_connection const* c);\n'
+    '#endif',
+    '#if TORRENT_USE_RTC\n'
+    '#  ifdef __EMSCRIPTEN__\n'
+    '\t\tvoid remove_request(aux::wasm_websocket_tracker_connection const* c);\n'
+    '#  else\n'
+    '\t\tvoid remove_request(aux::websocket_tracker_connection const* c);\n'
+    '#  endif\n'
+    '#endif')
+
+# m_websocket_conns — conditional map value type
+content = content.replace(
+    '#if TORRENT_USE_RTC\n'
+    '\t\t// websocket connections by URL\n'
+    '\t\tstd::unordered_map<std::string, std::shared_ptr<aux::websocket_tracker_connection>> m_websocket_conns;\n'
+    '#endif',
+    '#if TORRENT_USE_RTC\n'
+    '\t\t// websocket connections by URL\n'
+    '#  ifdef __EMSCRIPTEN__\n'
+    '\t\tstd::unordered_map<std::string, std::shared_ptr<aux::wasm_websocket_tracker_connection>> m_websocket_conns;\n'
+    '#  else\n'
+    '\t\tstd::unordered_map<std::string, std::shared_ptr<aux::websocket_tracker_connection>> m_websocket_conns;\n'
+    '#  endif\n'
+    '#endif')
+
+with open(path, 'w') as f:
+    f.write(content)
+print("Patched tracker_manager.hpp (surgical)")
+
+# --- Selectively guard websocket_tracker_connection.hpp ---
+# Keep tracker_answer, websocket_tracker_response, parse fn visible on all platforms.
+# Guard only Beast/SSL includes and the class definition.
+path = '/src/extern/libtorrent/include/libtorrent/aux_/websocket_tracker_connection.hpp'
+with open(path) as f:
+    content = f.read()
+
+# Guard Beast/SSL-specific includes
+content = content.replace(
+    '#include "libtorrent/aux_/websocket_stream.hpp"\n'
+    '#include "libtorrent/error_code.hpp"',
+    '#ifndef __EMSCRIPTEN__\n'
+    '#include "libtorrent/aux_/websocket_stream.hpp"\n'
+    '#endif\n'
+    '#include "libtorrent/error_code.hpp"')
+
+content = content.replace(
+    '#include "libtorrent/aux_/resolver_interface.hpp"\n',
+    '#ifndef __EMSCRIPTEN__\n'
+    '#include "libtorrent/aux_/resolver_interface.hpp"\n'
+    '#endif\n')
+
+content = content.replace(
+    '#include <boost/beast/core/flat_buffer.hpp>\n',
+    '#ifndef __EMSCRIPTEN__\n'
+    '#include <boost/beast/core/flat_buffer.hpp>\n'
+    '#endif\n')
+
+# Guard the class definition (keep tracker_answer before it visible)
+content = content.replace(
+    'struct TORRENT_EXTRA_EXPORT websocket_tracker_connection : tracker_connection\n'
+    '{',
+    '#ifndef __EMSCRIPTEN__\n'
+    'struct TORRENT_EXTRA_EXPORT websocket_tracker_connection : tracker_connection\n'
+    '{')
+
+content = content.replace(
+    '\tbool m_sending = false;\n'
+    '};\n'
+    '\n'
+    'struct websocket_tracker_response {',
+    '\tbool m_sending = false;\n'
+    '};\n'
+    '#endif // !__EMSCRIPTEN__\n'
+    '\n'
+    'struct websocket_tracker_response {')
+
+with open(path, 'w') as f:
+    f.write(content)
+print("Patched websocket_tracker_connection.hpp (selective guards)")
+
+# --- Granularly stub websocket_tracker_connection.cpp ---
+# Wrap only class methods (not the parse function) so
+# parse_websocket_tracker_response() stays available on Emscripten.
+path = '/src/extern/libtorrent/src/websocket_tracker_connection.cpp'
+with open(path) as f:
+    content = f.read()
+
+# Start guard before the class constructor
+content = content.replace(
+    'websocket_tracker_connection::websocket_tracker_connection(io_context& ios',
+    '#ifndef __EMSCRIPTEN__\n'
+    'websocket_tracker_connection::websocket_tracker_connection(io_context& ios')
+
+# End guard after the fail() method, before parse_websocket_tracker_response()
+content = content.replace(
+    'void websocket_tracker_connection::fail(operation_t op, error_code const& ec)\n'
+    '{\n'
+    '\ttracker_connection::fail(ec, op, ec.message().c_str(), seconds32{120}, seconds32{120});\n'
+    '}\n'
+    '\n'
+    'TORRENT_EXTRA_EXPORT',
+    'void websocket_tracker_connection::fail(operation_t op, error_code const& ec)\n'
+    '{\n'
+    '\ttracker_connection::fail(ec, op, ec.message().c_str(), seconds32{120}, seconds32{120});\n'
+    '}\n'
+    '#endif // !__EMSCRIPTEN__\n'
+    '\n'
+    'TORRENT_EXTRA_EXPORT')
+
+with open(path, 'w') as f:
+    f.write(content)
+print("Patched websocket_tracker_connection.cpp (granular stub)")
+
+# --- Stub websocket_stream.cpp (Beast transport — not needed on WASM) ---
+path = '/src/extern/libtorrent/src/websocket_stream.cpp'
+with open(path) as f:
+    content = f.read()
+content = '#ifndef __EMSCRIPTEN__\n' + content + '\n#endif // !__EMSCRIPTEN__\n'
+with open(path, 'w') as f:
+    f.write(content)
+print("Stubbed websocket_stream.cpp")
+PYEOF
 
 # Emscripten platform stubs:
 # 1. sys/sysctl.h — libtorrent's BSD fallback uses sysctl() to query physical
@@ -77,7 +674,71 @@ RUN mkdir -p /src/emscripten-stubs/sys \
 RUN sed -i "s/#error \"Don't know how to enumerate network interfaces on this platform\"/ec = boost::asio::error::operation_not_supported;/" \
        /src/extern/libtorrent/src/enum_net.cpp \
     && sed -i 's/#error "don'\''t know how to enumerate network routes on this platform"/ec = boost::asio::error::operation_not_supported;/' \
-       /src/extern/libtorrent/src/enum_net.cpp
+       /src/extern/libtorrent/src/enum_net.cpp \
+    && sed -i 's/#if TORRENT_USE_RTC && !TORRENT_USE_SSL/#if TORRENT_USE_RTC \&\& !TORRENT_USE_SSL \&\& !defined(__EMSCRIPTEN__)/' \
+       /src/extern/libtorrent/include/libtorrent/config.hpp
+
+# Patch torrent.cpp: create dummy endpoint for WebSocket trackers when no
+# listen sockets exist. On Emscripten, m_listen_sockets is always empty so
+# m_listen_socket_version stays at 0, matching the default ae.listen_socket_version,
+# causing refresh_endpoint_list() to early-return before creating any endpoints.
+# Fix: insert WebSocket dummy-endpoint check BEFORE the version guard, so that
+# ws:// trackers get a placeholder endpoint even when listen sockets never change.
+RUN python3 <<'PYEOF'
+path = '/src/extern/libtorrent/src/torrent.cpp'
+with open(path) as f:
+    content = f.read()
+
+# Patch 1: Insert ws:// dummy-endpoint block BEFORE the version check.
+# Original code:
+#   #if TORRENT_USE_I2P ... return; } #endif
+#   auto const ver = ses.listen_socket_version();
+#   if (ver == ae.listen_socket_version) return;
+# After patch:
+#   #if TORRENT_USE_I2P ... return; } #endif
+#   #if TORRENT_USE_RTC (dummy endpoint for ws:// when empty) #endif
+#   auto const ver = ses.listen_socket_version();
+#   if (ver == ae.listen_socket_version) return;
+content = content.replace(
+    '#endif\n'
+    '\n'
+    '\t\tauto const ver = ses.listen_socket_version();\n'
+    '\t\tif (ver == ae.listen_socket_version)\n'
+    '\t\t\treturn;\n'
+    '\n'
+    '\t\t// update the endpoint list by adding entries for new listen sockets',
+    '#endif\n'
+    '\n'
+    '#if TORRENT_USE_RTC\n'
+    '\t\t// WebSocket trackers don\'t need TCP/UDP listen sockets.\n'
+    '\t\t// On platforms with none (e.g. Emscripten/WASM), for_each_listen_socket\n'
+    '\t\t// is a no-op, listen_socket_version stays 0, and the version guard below\n'
+    '\t\t// would skip endpoint creation forever. Create a dummy endpoint here.\n'
+    '\t\tif(auto pos = ae.url.find(\':\'); pos != string_view::npos)\n'
+    '\t\t{\n'
+    '\t\t\tstring_view const protocol = string_view(ae.url).substr(0, pos);\n'
+    '\t\t\tif ((protocol == "ws" || protocol == "wss") && ae.endpoints.empty())\n'
+    '\t\t\t{\n'
+    '\t\t\t\tae.endpoints.emplace_back(aux::listen_socket_handle(), complete_sent);\n'
+    '\t\t\t\treturn;\n'
+    '\t\t\t}\n'
+    '\t\t}\n'
+    '#endif\n'
+    '\n'
+    '\t\tauto const ver = ses.listen_socket_version();\n'
+    '\t\tif (ver == ae.listen_socket_version)\n'
+    '\t\t\treturn;\n'
+    '\n'
+    '\t\t// update the endpoint list by adding entries for new listen sockets')
+
+# Patch 2: Keep the existing #if TORRENT_USE_RTC block inside the function
+# (after the for_each_listen_socket loop) to limit to max 1 endpoint for ws://.
+# No change needed — it's still there from the original code.
+
+with open(path, 'w') as f:
+    f.write(content)
+print("Patched torrent.cpp: dummy endpoint for ws:// trackers before version guard")
+PYEOF
 
 # Configure — uses pre-installed vcpkg packages via VCPKG_INSTALLED_DIR.
 # VCPKG_CHAINLOAD_TOOLCHAIN_FILE must be passed explicitly on the cmake
@@ -93,6 +754,7 @@ RUN cmake -S /src -B /src/build/wasm \
     -DVCPKG_OVERLAY_TRIPLETS=/src/triplets \
     -DVCPKG_MANIFEST_DIR=/src \
     -DVCPKG_INSTALLED_DIR=/opt/vcpkg-wasm \
+    "-DVCPKG_INSTALL_OPTIONS=--allow-unsupported" \
     -DCMAKE_BUILD_TYPE=Release \
     "-DCMAKE_C_FLAGS=-pthread -isystem /src/emscripten-stubs" \
     "-DCMAKE_CXX_FLAGS=-pthread -DBOOST_ASIO_HAS_PTHREADS -DTORRENT_HAS_SALEN=0 -isystem /src/emscripten-stubs" \
@@ -100,7 +762,7 @@ RUN cmake -S /src -B /src/build/wasm \
     -DSEEKSERVE_BUILD_DEMO=OFF \
     -DSEEKSERVE_BUILD_CAPI=ON \
     -DSEEKSERVE_CAPI_STATIC=ON \
-    -DSEEKSERVE_ENABLE_WEBTORRENT=OFF \
+    -DSEEKSERVE_ENABLE_WEBTORRENT=ON \
     -Dencryption=OFF
 
 RUN cmake --build /src/build/wasm --target seekserve-capi -j$(nproc)

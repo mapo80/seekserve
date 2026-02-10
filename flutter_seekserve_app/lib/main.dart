@@ -31,7 +31,7 @@ class _SeekServeAppState extends State<SeekServeApp> {
 
   Future<void> _initEngine() async {
     final config = await getPlatformConfig();
-    _manager.init(config.savePath ?? '/seekserve', config: config);
+    await _manager.init(config.savePath ?? '/seekserve', config: config);
     setState(() => _initialised = true);
   }
 

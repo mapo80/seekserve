@@ -8,6 +8,10 @@
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/file_storage.hpp>
 
+#ifdef __EMSCRIPTEN__
+#include <boost/asio/post.hpp>
+#endif
+
 #include <filesystem>
 
 namespace seekserve {
@@ -37,6 +41,14 @@ SeekServeEngine::SeekServeEngine(const Config& config)
     if (!saved.empty()) {
         spdlog::info("Engine: restored {} torrent(s)", saved.size());
     }
+
+#ifdef __EMSCRIPTEN__
+    // On Emscripten, always start the ioc_ thread immediately.
+    // Alert handlers (metadata_received, piece_finished) post deferred work
+    // to ioc_, and we need it running before start_server() is called.
+    work_guard_ = std::make_unique<work_guard_t>(ioc_.get_executor());
+    io_thread_ = std::thread([this]() { ioc_.run(); });
+#endif
 }
 
 SeekServeEngine::~SeekServeEngine() {
@@ -46,6 +58,16 @@ SeekServeEngine::~SeekServeEngine() {
     // Must stop before those members are destroyed.
     if (sessions_) {
         sessions_->alert_dispatcher().stop();
+    }
+
+    // On Emscripten, ioc_ thread starts in constructor (before start_server).
+    // stop_server() might not have stopped it if server_running_ was never set.
+    if (work_guard_) {
+        work_guard_.reset();
+    }
+    ioc_.stop();
+    if (io_thread_.joinable()) {
+        io_thread_.join();
     }
 
 #ifndef __EMSCRIPTEN__
@@ -61,6 +83,33 @@ void SeekServeEngine::wire_alerts() {
     // metadata_received_alert → catalog + event
     sessions_->alert_dispatcher().on<lt::metadata_received_alert>(
         [this](const lt::metadata_received_alert& a) {
+#ifdef __EMSCRIPTEN__
+            // On Emscripten, torrent_handle methods are blocking sync_calls that
+            // deadlock from the AlertDispatcher thread. Use id_from_handle()
+            // (safe weak_ptr comparison) and defer torrent_file() to ioc_ thread.
+            auto handle = a.handle;
+            auto id = sessions_->id_from_handle(handle);
+            if (id.empty()) return;
+
+            {
+                std::lock_guard lock(mu_);
+                if (removed_ids_.count(id)) return;
+            }
+
+            boost::asio::post(ioc_, [this, handle, id]() {
+                auto ti = handle.torrent_file();
+                if (!ti) return;
+
+                catalog_.on_metadata_received(id, ti);
+
+                auto files_result = catalog_.list_files(id);
+                if (files_result) {
+                    cache_->on_torrent_added(id, files_result.value());
+                }
+
+                fire_event("metadata_received", "{\"torrent_id\":\"" + id + "\"}");
+            });
+#else
             auto ti = a.handle.torrent_file();
             auto st = a.handle.status(lt::torrent_handle::query_name);
             auto id = infohash_to_hex(st.info_hashes);
@@ -79,9 +128,10 @@ void SeekServeEngine::wire_alerts() {
             }
 
             fire_event("metadata_received", "{\"torrent_id\":\"" + id + "\"}");
+#endif
         });
 
-    // add_torrent_alert → catalog (for .torrent files with embedded metadata)
+    // add_torrent_alert → store handle (Emscripten async) + catalog
     sessions_->alert_dispatcher().on<lt::add_torrent_alert>(
         [this](const lt::add_torrent_alert& a) {
             if (a.error) {
@@ -89,6 +139,19 @@ void SeekServeEngine::wire_alerts() {
                 fire_event("error", "{\"message\":\"" + a.error.message() + "\"}");
                 return;
             }
+
+#ifdef __EMSCRIPTEN__
+            // On Emscripten, add_torrent() uses async_add_torrent() so the handle
+            // isn't stored synchronously. Store it here when the alert arrives.
+            // Use info_hashes from the alert params — torrent_handle methods are
+            // blocking sync_calls that deadlock from the AlertDispatcher thread.
+            // Skip torrent_file() entirely; metadata processing will happen via
+            // metadata_received_alert (deferred to ioc_ thread).
+            auto id = infohash_to_hex(a.params.info_hashes);
+            sessions_->store_handle(a.handle, id);
+            spdlog::info("Engine: torrent added (WASM) {}", id);
+            fire_event("torrent_added", "{\"torrent_id\":\"" + id + "\"}");
+#else
             auto ti = a.handle.torrent_file();
             if (ti) {
                 auto st = a.handle.status(lt::torrent_handle::query_name);
@@ -109,13 +172,19 @@ void SeekServeEngine::wire_alerts() {
 
                 fire_event("metadata_received", "{\"torrent_id\":\"" + id + "\"}");
             }
+#endif
         });
 
     // piece_finished_alert → availability + scheduler + byte_source
     sessions_->alert_dispatcher().on<lt::piece_finished_alert>(
         [this](const lt::piece_finished_alert& a) {
+#ifdef __EMSCRIPTEN__
+            auto id = sessions_->id_from_handle(a.handle);
+            if (id.empty()) return;
+#else
             auto st = a.handle.status(lt::torrent_handle::query_name);
             auto id = infohash_to_hex(st.info_hashes);
+#endif
             auto piece = static_cast<PieceIndex>(a.piece_index);
 
             std::lock_guard lock(mu_);
@@ -130,14 +199,40 @@ void SeekServeEngine::wire_alerts() {
     // file_completed_alert → cache
     sessions_->alert_dispatcher().on<lt::file_completed_alert>(
         [this](const lt::file_completed_alert& a) {
+#ifdef __EMSCRIPTEN__
+            auto id = sessions_->id_from_handle(a.handle);
+            if (id.empty()) return;
+#else
             auto st = a.handle.status(lt::torrent_handle::query_name);
             auto id = infohash_to_hex(st.info_hashes);
+#endif
             auto fi = static_cast<FileIndex>(a.index);
 
             cache_->on_file_completed(id, fi);
             fire_event("file_completed",
                 "{\"torrent_id\":\"" + id + "\",\"file_index\":" + std::to_string(fi) + "}");
         });
+
+#ifdef __EMSCRIPTEN__
+    // state_update_alert → cache status for non-blocking get_status_json()
+    sessions_->alert_dispatcher().on<lt::state_update_alert>(
+        [this](const lt::state_update_alert& a) {
+            std::lock_guard lock(status_mu_);
+            for (const auto& st : a.status) {
+                auto id = infohash_to_hex(st.info_hashes);
+                auto& cs = cached_statuses_[id];
+                cs.name = st.name;
+                cs.progress = st.progress;
+                cs.download_rate = st.download_rate;
+                cs.upload_rate = st.upload_rate;
+                cs.num_peers = st.num_peers;
+                cs.num_seeds = st.num_seeds;
+                cs.total_download = st.total_download;
+                cs.total_upload = st.total_upload;
+                cs.state = static_cast<int>(st.state);
+            }
+        });
+#endif
 }
 
 Result<TorrentId> SeekServeEngine::add_torrent(const std::string& uri,
@@ -209,6 +304,12 @@ Result<void> SeekServeEngine::select_file(const TorrentId& id, FileIndex fi) {
     // Without this, ByteSource::read() would block waiting for pieces
     // that are already on disk, since piece_finished_alert only fires
     // for NEW completions after this point.
+#ifdef __EMSCRIPTEN__
+    // On Emscripten, handle.status(query_pieces) is a sync_call that can
+    // deadlock from the browser main thread. Skip pre-population — WASM
+    // sessions always start fresh (no persisted pieces), and pieces will
+    // be marked as they arrive via piece_finished_alert.
+#else
     {
         auto st = handle.status(lt::torrent_handle::query_pieces);
         for (int p = 0; p < num_pieces; ++p) {
@@ -217,6 +318,7 @@ Result<void> SeekServeEngine::select_file(const TorrentId& id, FileIndex fi) {
             }
         }
     }
+#endif
 
     state->mapper = std::make_unique<ByteRangeMapper>(ti->layout(), fi);
     state->selected_file = fi;
@@ -279,6 +381,59 @@ std::string SeekServeEngine::get_status_json(const TorrentId& id) {
         return status_json.dump();
     }
 
+#ifdef __EMSCRIPTEN__
+    // On Emscripten, handle.status() is a blocking sync_call that deadlocks
+    // when called from the browser main thread. Use cached status instead.
+    // Request fresh status data for next call.
+    sessions_->session().post_torrent_updates();
+    {
+        auto selected = catalog_.selected_file(id);
+        std::lock_guard lock(status_mu_);
+        auto it = cached_statuses_.find(id);
+        if (it != cached_statuses_.end()) {
+            const auto& cs = it->second;
+            status_json["torrent_id"] = id;
+            status_json["name"] = cs.name;
+            status_json["progress"] = cs.progress;
+            status_json["download_rate"] = cs.download_rate;
+            status_json["upload_rate"] = cs.upload_rate;
+            status_json["num_peers"] = cs.num_peers;
+            status_json["num_seeds"] = cs.num_seeds;
+            status_json["total_download"] = cs.total_download;
+            status_json["total_upload"] = cs.total_upload;
+            status_json["state"] = cs.state;
+        } else {
+            status_json["torrent_id"] = id;
+            status_json["name"] = "";
+            status_json["progress"] = 0.0;
+            status_json["download_rate"] = 0;
+            status_json["upload_rate"] = 0;
+            status_json["num_peers"] = 0;
+            status_json["num_seeds"] = 0;
+            status_json["total_download"] = 0;
+            status_json["total_upload"] = 0;
+            status_json["state"] = 0;
+        }
+        status_json["has_metadata"] = catalog_.has_metadata(id);
+        status_json["selected_file"] = selected.has_value() ? json(*selected) : json(nullptr);
+
+        if (selected.has_value()) {
+            status_json["offline_ready"] = cache_->is_offline_ready(id, *selected);
+        }
+    }
+
+    {
+        std::lock_guard lock(mu_);
+        auto* state = find_state(id);
+        if (state && state->scheduler) {
+            status_json["stream_mode"] = static_cast<int>(state->scheduler->current_mode());
+            status_json["playhead_piece"] = state->scheduler->playhead_piece();
+            status_json["active_deadlines"] = state->scheduler->active_deadlines();
+        }
+    }
+
+    return status_json.dump();
+#else
     auto st = handle.status();
     auto selected = catalog_.selected_file(id);
 
@@ -310,6 +465,7 @@ std::string SeekServeEngine::get_status_json(const TorrentId& id) {
     }
 
     return status_json.dump();
+#endif
 }
 
 Result<std::uint16_t> SeekServeEngine::start_server(std::uint16_t port) {
@@ -318,9 +474,8 @@ Result<std::uint16_t> SeekServeEngine::start_server(std::uint16_t port) {
     }
 
 #ifdef __EMSCRIPTEN__
-    // On WASM: no HTTP servers, just start io_context for tick timer
-    work_guard_ = std::make_unique<work_guard_t>(ioc_.get_executor());
-    io_thread_ = std::thread([this]() { ioc_.run(); });
+    // On WASM: no HTTP servers, just start tick timer.
+    // ioc_ thread was already started in the constructor.
     start_tick_timer();
     server_running_.store(true);
     spdlog::info("Engine: WASM mode started (no HTTP servers)");
@@ -409,12 +564,20 @@ void SeekServeEngine::start_tick_timer() {
 void SeekServeEngine::on_tick(const boost::system::error_code& ec) {
     if (ec) return;
 
+#ifdef __EMSCRIPTEN__
+    // Request status update for the cache (fires state_update_alert)
+    sessions_->session().post_torrent_updates();
+#endif
+
     {
         std::lock_guard lock(mu_);
         for (auto& [id, state] : states_) {
             if (!state->scheduler) continue;
             auto handle = sessions_->get_handle(id);
             if (!handle.is_valid()) continue;
+            // on_tick runs on the ioc_ thread (pthread), NOT the browser
+            // main thread, so handle.status() is safe here — it can block
+            // waiting for the session thread without risking __proxy:'sync' deadlock.
             auto st = handle.status();
             state->scheduler->tick(handle, st);
 

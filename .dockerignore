@@ -1,0 +1,14 @@
+build/
+downloads/
+flutter_seekserve_app/
+flutter_seekserve/build/
+flutter_seekserve/.dart_tool/
+flutter_seekserve_ui/build/
+flutter_seekserve_ui/.dart_tool/
+.idea/
+.vscode/
+*.xcworkspace/
+*.xcodeproj/
+vcpkg_installed/
+.DS_Store
+docs/

@@ -260,7 +260,9 @@ void ss_free_string(char* str) {
 } // extern "C"
 
 #ifdef __EMSCRIPTEN__
+#include <emscripten.h>
 // Emscripten executable entry point (required for PROXY_TO_PTHREAD).
-// Actual functionality is accessed via exported C functions (ccall/cwrap).
-int main() { return 0; }
+// Must NOT return — returning from main() with PROXY_TO_PTHREAD calls exit().
+// emscripten_exit_with_live_runtime() keeps the runtime alive for ccall/cwrap.
+int main() { emscripten_exit_with_live_runtime(); }
 #endif

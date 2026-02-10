@@ -72,7 +72,7 @@ class SsTorrentManager extends ChangeNotifier {
       statuses.fold(0.0, (sum, s) => sum + s.uploadRate);
 
   /// Initialises the engine with default config based on [savePath].
-  void init(String savePath, {SeekServeConfig? config}) {
+  Future<void> init(String savePath, {SeekServeConfig? config}) async {
     if (_client != null) return;
 
     try {
@@ -85,6 +85,8 @@ class SsTorrentManager extends ChangeNotifier {
               logLevel: 'debug',
             ),
       );
+
+      await _client!.initialize();
 
       final port = _client!.startServer();
       _serverPort = port > 0 ? port : null;
@@ -215,13 +217,13 @@ class SsTorrentManager extends ChangeNotifier {
             entry.files = _client!.listFiles(torrentId);
           } catch (_) {}
         }
-        notifyListeners();
+        _safeNotify();
       case FileCompleted(:final torrentId, :final fileIndex):
         debugPrint('File completed: $torrentId file $fileIndex');
-        notifyListeners();
+        _safeNotify();
       case TorrentError(:final torrentId, :final message):
         _errorMessage = 'Torrent $torrentId: $message';
-        notifyListeners();
+        _safeNotify();
       case UnknownEvent():
         break;
     }
@@ -229,7 +231,7 @@ class SsTorrentManager extends ChangeNotifier {
 
   void _onEventError(Object error) {
     _errorMessage = error.toString();
-    notifyListeners();
+    _safeNotify();
   }
 
   void _pollStatus() {
@@ -244,7 +246,7 @@ class SsTorrentManager extends ChangeNotifier {
         }
       } catch (_) {}
     }
-    notifyListeners();
+    _safeNotify();
   }
 
   List<FileInfo>? _tryListFiles(String torrentId) {
@@ -253,6 +255,14 @@ class SsTorrentManager extends ChangeNotifier {
     } catch (_) {
       return null;
     }
+  }
+
+  /// Defer notifyListeners to a microtask so it never fires mid-build.
+  void _safeNotify() {
+    Future.microtask(() {
+      if (!hasListeners) return;
+      notifyListeners();
+    });
   }
 
   @override

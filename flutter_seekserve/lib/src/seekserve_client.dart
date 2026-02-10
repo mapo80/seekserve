@@ -17,6 +17,12 @@ abstract class SeekServeClient {
   factory SeekServeClient({SeekServeConfig? config}) =>
       createClient(config: config);
 
+  /// Async initialisation hook (must be awaited before calling other methods).
+  ///
+  /// On web, this loads the WASM module and creates the C engine.
+  /// On native, this is a no-op.
+  Future<void> initialize();
+
   /// Stream of events from the engine (metadata, file completions, errors).
   Stream<SeekServeEvent> get events;
 

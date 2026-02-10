@@ -110,6 +110,12 @@ case "$BUILD_TYPE" in
         EXTRA_LINKER_FLAGS="-fsanitize=thread"
         echo "  ThreadSanitizer enabled"
         ;;
+    wasm)
+        echo "  WASM build via Docker (Emscripten)"
+        echo ""
+        echo "Running docker/build-wasm.sh ..."
+        exec "$SCRIPT_DIR/docker/build-wasm.sh"
+        ;;
     *)
         echo "  Unknown build type '$BUILD_TYPE', using Debug"
         ;;

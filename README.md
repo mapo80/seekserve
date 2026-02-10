@@ -557,9 +557,12 @@ The status bar updates every second showing progress, download rate, peer count,
     libtorrent (submodule, master branch)
     /          \
    v            v
- Boost       libdatachannel (WebTorrent)
+ Boost       libdatachannel (WebTorrent, native)
  OpenSSL     /       |       \
            libjuice usrsctp  plog
+
+ On WASM: libdatachannel is replaced by datachannel-wasm
+          (browser-native WebRTC via JS interop)
 ```
 
 Build targets:
@@ -714,12 +717,13 @@ seekserve/
 |-- .gitmodules                 libtorrent submodule (master branch)
 |
 |-- extern/
-|   +-- libtorrent/             Git submodule (arvidn/libtorrent@master)
-|       +-- deps/
-|           +-- libdatachannel/ WebRTC Data Channels (WebTorrent)
-|           +-- libjuice/       ICE / NAT traversal
-|           +-- usrsctp/        SCTP protocol
-|           +-- plog/           Logging (header-only)
+|   |-- libtorrent/             Git submodule (arvidn/libtorrent@master)
+|   |   +-- deps/
+|   |       +-- libdatachannel/ WebRTC Data Channels (native WebTorrent)
+|   |       +-- libjuice/       ICE / NAT traversal
+|   |       +-- usrsctp/        SCTP protocol
+|   |       +-- plog/           Logging (header-only)
+|   +-- datachannel-wasm/       Git submodule (WebRTC for WASM/Emscripten)
 |
 |-- seekserve-core/             STATIC LIB: torrent engine + scheduling
 |   |-- include/seekserve/
@@ -858,10 +862,16 @@ seekserve/
 |   |-- build-ios.sh                 iOS arm64 (device + simulator) -> XCFramework
 |   |-- build-android.sh            Android 3 ABIs via NDK -> .so files
 |   |-- build-flutter-natives.sh    Orchestrator: build + copy to plugin
+|   |-- deploy-wasm-to-app.sh       Copy WASM artifacts to Flutter web app
 |   +-- dev-ios-sim.sh              Incremental build + run on iOS Simulator
 |
+|-- docker/
+|   |-- Dockerfile.wasm              3-stage Emscripten WASM build
+|   +-- build-wasm.sh               Docker build + extract artifacts
+|
 |-- triplets/
-|   +-- arm-neon-android.cmake       Custom vcpkg triplet (NDK 29 NEON=ON)
+|   |-- arm-neon-android.cmake       Custom vcpkg triplet (NDK 29 NEON=ON)
+|   +-- wasm32-emscripten.cmake      Custom vcpkg triplet for Emscripten
 |
 |-- docs/                            Specification & design documents
 |   |-- ARCHITECTURE.md, HTTP_RANGE_SPEC.md, SCHEDULER_POLICY.md
@@ -903,6 +913,7 @@ This will:
 ./setup.sh release     # Optimized release build
 ./setup.sh asan        # Debug + AddressSanitizer
 ./setup.sh tsan        # Debug + ThreadSanitizer
+./setup.sh wasm        # WebAssembly build via Docker (Emscripten)
 ```
 
 ### Manual CMake
@@ -941,15 +952,18 @@ All build scripts are in the project root (`setup.sh`) or in the `scripts/` dire
 |----------|---------|
 | First-time C++ SDK build | `./setup.sh debug` |
 | Release build (optimized) | `./setup.sh release` |
+| WASM build (Docker) | `./setup.sh wasm` |
 | Run C++ tests | `cd build/debug && ctest` |
 | Build iOS native libs | `scripts/build-flutter-natives.sh ios` |
 | Build Android native libs | `scripts/build-flutter-natives.sh android` |
 | Build all native libs | `scripts/build-flutter-natives.sh all` |
 | Dev loop on iOS Simulator | `scripts/dev-ios-sim.sh` |
+| Deploy WASM to Flutter web | `scripts/deploy-wasm-to-app.sh` |
 | Run Flutter plugin tests | `cd flutter_seekserve && flutter test` |
 | Run Flutter UI tests | `cd flutter_seekserve_ui && flutter test` |
 | Build Flutter app (iOS) | `cd flutter_seekserve_app && flutter build ios` |
 | Build Flutter app (Android) | `cd flutter_seekserve_app && flutter build apk` |
+| Build Flutter app (Web) | `cd flutter_seekserve_app && flutter build web` |
 
 ### `setup.sh` -- C++ SDK Bootstrap
 
@@ -960,6 +974,7 @@ The main entry point for building the C++ SDK from scratch. It handles all depen
 ./setup.sh release     # Optimized release build (no tests)
 ./setup.sh asan        # Debug + AddressSanitizer (memory errors)
 ./setup.sh tsan        # Debug + ThreadSanitizer (data races)
+./setup.sh wasm        # WebAssembly build via Docker (Emscripten + WebTorrent)
 ```
 
 **When to use:** First-time setup, after pulling changes, or when you need a clean rebuild of the native C++ SDK for desktop (macOS/Linux).
@@ -1777,7 +1792,8 @@ WASM:    Dart → dart:js_interop → JS glue → C API (.wasm) → Engine → S
 
 On the web:
 - **libtorrent** runs as WASM with pthreads (Web Workers + `SharedArrayBuffer`)
-- **Networking** uses WebRTC via `datachannel-wasm` (browser-native WebRTC bridge)
+- **WebTorrent** is enabled — uses `datachannel-wasm` (browser-native WebRTC bridge) instead of `libdatachannel`
+- **Networking** uses WebRTC data channels for peer-to-peer BitTorrent (browsers can't open TCP/UDP sockets)
 - **Storage** uses Emscripten MEMFS (in-memory filesystem)
 - **Video playback** uses an HTML5 `<video>` element instead of `media_kit`/mpv
 - **HTTP serving** is handled by a Service Worker that intercepts `/seekserve-stream/{id}/{fi}` URLs
@@ -1808,10 +1824,10 @@ docker/build-wasm.sh
 This uses the `emscripten/emsdk:3.1.56` Docker image to cross-compile the C++ SDK to WebAssembly. Output:
 
 ```
-build/wasm/seekserve-capi/
-  seekserve.js          # Emscripten JS loader
-  seekserve.wasm        # Compiled WebAssembly module
-  seekserve.worker.js   # Emscripten pthread worker
+build/wasm-out/
+  seekserve.js          # Emscripten JS loader (~147 KB)
+  seekserve.wasm        # Compiled WebAssembly module (~4.2 MB)
+  seekserve.worker.js   # Emscripten pthread worker (~2.7 KB)
 ```
 
 #### Step 2: Deploy WASM Artifacts to Flutter App
@@ -1906,11 +1922,11 @@ Supported responses: `200 OK` (full file), `206 Partial Content` (range request)
 
 ### Current Limitations
 
-- **WebTorrent only** — browser peers connect via WebRTC, not standard TCP BitTorrent
+- **WebTorrent peers only** — browser WASM connects via WebRTC data channels, not standard TCP/UDP BitTorrent. Seeds must have WebTorrent enabled to be reachable.
 - **MEMFS storage** — all downloaded data is in memory (lost on page refresh); IDBFS persistence is not yet wired
 - **No `SsSeekControls`** — the `media_kit` `Player` type doesn't exist on web; the HTML5 video player has its own built-in controls
 - **COOP/COEP restrictions** — `SharedArrayBuffer` requires strict cross-origin isolation, which may block some third-party resources
-- **Binary size** — the WASM module is ~10-20 MB; consider lazy loading and `-Oz` optimization for production
+- **Binary size** — the WASM module is ~4-5 MB; consider lazy loading and `-Oz` optimization for production
 
 ---
 
@@ -1932,7 +1948,8 @@ Supported responses: `200 OK` (full file), `206 Partial Content` (range request)
 | Dependency | Source | Purpose |
 |------------|--------|---------|
 | [libtorrent](https://github.com/arvidn/libtorrent) | Git submodule (master) | BitTorrent protocol, piece management, WebTorrent |
-| [libdatachannel](https://github.com/nicknacknow/libdatachannel) | Nested submodule (via libtorrent) | WebRTC Data Channels for WebTorrent |
+| [libdatachannel](https://github.com/paullouisageneau/libdatachannel) | Nested submodule (via libtorrent) | WebRTC Data Channels for WebTorrent (native) |
+| [datachannel-wasm](https://github.com/paullouisageneau/datachannel-wasm) | Git submodule | WebRTC Data Channels for WebTorrent (WASM/browser) |
 | Boost (Asio, Beast, JSON, System) | vcpkg | HTTP server, async I/O, JSON parsing |
 | [OpenSSL](https://www.openssl.org/) | vcpkg | TLS for libtorrent + libdatachannel |
 | [nlohmann/json](https://github.com/nlohmann/json) | vcpkg | JSON serialization (C++ side) |

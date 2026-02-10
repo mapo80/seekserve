@@ -117,6 +117,23 @@ private:
     mutable std::mutex event_mu_;
 
     std::atomic<bool> server_running_{false};
+
+#ifdef __EMSCRIPTEN__
+    // On Emscripten, handle.status() is a sync_call that can deadlock when
+    // called from the browser main thread (thread 0) because the session
+    // thread may be blocked on __proxy:'sync' waiting for thread 0.
+    // Solution: cache status from state_update_alert, return from cache.
+    struct CachedStatus {
+        std::string name;
+        float progress{0};
+        int download_rate{0}, upload_rate{0};
+        int num_peers{0}, num_seeds{0};
+        std::int64_t total_download{0}, total_upload{0};
+        int state{0};  // lt::torrent_status::state_t
+    };
+    std::unordered_map<TorrentId, CachedStatus> cached_statuses_;
+    mutable std::mutex status_mu_;
+#endif
 };
 
 } // namespace seekserve

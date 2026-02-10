@@ -2,3 +2,6 @@
 	path = extern/libtorrent
 	url = https://github.com/arvidn/libtorrent.git
 	branch = master
+[submodule "extern/datachannel-wasm"]
+	path = extern/datachannel-wasm
+	url = https://github.com/paullouisageneau/datachannel-wasm.git
