@@ -33,7 +33,7 @@ for f in seekserve.js seekserve.wasm seekserve.worker.js; do
 done
 
 # 2. Copy JS glue files from the plugin
-for f in seekserve_wasm.js seekserve_reader.js seekserve_sw.js; do
+for f in seekserve_wasm.js seekserve_sw.js; do
     src="$PLUGIN_WEB/$f"
     if [ -f "$src" ]; then
         cp "$src" "$APP_WEB/"

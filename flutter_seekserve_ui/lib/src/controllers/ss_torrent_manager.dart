@@ -181,13 +181,20 @@ class SsTorrentManager extends ChangeNotifier {
 
     try {
       _client!.selectFile(torrentId, fileIndex);
-      final url = _client!.getStreamUrl(torrentId, fileIndex);
+      var url = _client!.getStreamUrl(torrentId, fileIndex);
       // Discover stream port from the URL.
       if (_streamPort == null) {
         final parsed = Uri.tryParse(url);
         if (parsed != null && parsed.port != 0) {
           _streamPort = parsed.port;
         }
+      }
+      // Append file name for MIME type detection by the Service Worker.
+      final files = entry?.files ?? listFiles(torrentId);
+      if (fileIndex < files.length) {
+        final basename = files[fileIndex].path.split('/').last;
+        final sep = url.contains('?') ? '&' : '?';
+        url = '$url${sep}name=${Uri.encodeComponent(basename)}';
       }
       _errorMessage = null;
       notifyListeners();

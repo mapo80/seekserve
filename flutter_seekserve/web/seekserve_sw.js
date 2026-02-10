@@ -36,13 +36,14 @@ self.addEventListener('fetch', (event) => {
   const torrentId = match[1];
   const fileIndex = parseInt(match[2], 10);
 
-  event.respondWith(handleStreamRequest(event.request, torrentId, fileIndex));
+  const name = url.searchParams.get('name') || '';
+  event.respondWith(handleStreamRequest(event.request, torrentId, fileIndex, name));
 });
 
 /**
  * Handle a stream request by communicating with the main thread.
  */
-async function handleStreamRequest(request, torrentId, fileIndex) {
+async function handleStreamRequest(request, torrentId, fileIndex, fileName) {
   try {
     // Get file size first
     const sizeResult = await sendToClient({
@@ -63,7 +64,7 @@ async function handleStreamRequest(request, torrentId, fileIndex) {
         status: 200,
         headers: {
           'Content-Length': totalSize.toString(),
-          'Content-Type': guessMimeType(torrentId),
+          'Content-Type': guessMimeType(fileName),
           'Accept-Ranges': 'bytes',
         },
       });
@@ -116,7 +117,7 @@ async function handleStreamRequest(request, torrentId, fileIndex) {
 
     const headers = {
       'Content-Length': length.toString(),
-      'Content-Type': guessMimeType(torrentId),
+      'Content-Type': guessMimeType(fileName),
       'Accept-Ranges': 'bytes',
     };
 
@@ -157,8 +158,13 @@ function sendToClient(message) {
  * Guess MIME type from file extension (torrent files may have extensions).
  * Falls back to video/mp4 as default.
  */
-function guessMimeType(torrentId) {
-  // Default to video/mp4 — the actual file extension is not in the URL
-  // pattern. In practice the Dart side could pass MIME type as a query param.
+function guessMimeType(fileName) {
+  if (fileName) {
+    const dot = fileName.lastIndexOf('.');
+    if (dot !== -1) {
+      const ext = fileName.substring(dot).toLowerCase();
+      if (MIME_TYPES[ext]) return MIME_TYPES[ext];
+    }
+  }
   return 'video/mp4';
 }
