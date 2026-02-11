@@ -1851,13 +1851,72 @@ WASM:    Dart → dart:js_interop → JS glue → C API (.wasm) → Engine → S
      STUN: stun.l.google.com:19302          ws://tracker.example.com
 ```
 
-On the web:
-- **libtorrent** runs as WASM with pthreads (Web Workers + `SharedArrayBuffer`)
-- **WebTorrent** is enabled — uses `datachannel-wasm` (browser-native WebRTC bridge) instead of `libdatachannel`
-- **Networking** uses WebRTC data channels for peer-to-peer BitTorrent (browsers can't open TCP/UDP sockets)
-- **Storage** uses Emscripten MEMFS (in-memory filesystem)
-- **Video playback** uses an HTML5 `<video>` element instead of `media_kit`/mpv
-- **HTTP serving** is handled by a Service Worker that intercepts `/seekserve-stream/{id}/{fi}` URLs
+### Native vs Web — Differences and Why
+
+The C++ engine is the same binary. Everything around it changes because browsers expose a different set of primitives than an OS process.
+
+```
+                      NATIVE (iOS/Android)                      WEB (WASM)
+                      ──────────────────                        ──────────
+
+  ┌─────────┐         dart:ffi → C API (.so/.a)                dart:js_interop → JS glue → cwrap
+  │ Binding │
+  └─────────┘         WHY: dart:ffi links a shared library     WHY: no .so on the web — Emscripten
+                      directly into the Dart process            compiles to .wasm, called via cwrap()
+
+  ┌─────────┐         TCP/UDP sockets                          WebRTC Data Channels
+  │ Network │         standard BitTorrent peers                 + WebSocket trackers (ws://)
+  └─────────┘
+                      WHY: OS gives the process raw             WHY: browsers forbid TCP/UDP sockets.
+                      socket access                             WebRTC is the only peer-to-peer path
+
+  ┌─────────┐         libdatachannel (C++)                     datachannel-wasm (JS bridge)
+  │ WebRTC  │         full DTLS/SCTP stack in native code      thin wrapper over browser RTCPeerConnection
+  └─────────┘
+                      WHY: native process links OpenSSL         WHY: on WASM there is no OpenSSL —
+                      and handles DTLS itself                   the browser already speaks DTLS/SCTP
+
+  ┌─────────┐         HttpRangeServer (Beast, loopback TCP)    Service Worker (seekserve_sw.js)
+  │ HTTP    │         real HTTP server on 127.0.0.1:PORT       intercepts fetch → MessageChannel → WASM
+  │ Range   │
+  └─────────┘         WHY: media_kit/VLC fetches a real        WHY: no TCP listen in browser.
+                      HTTP URL via localhost                    <video>.src triggers a fetch event that
+                                                               the SW intercepts and serves from WASM
+
+  ┌─────────┐         pthreads (native OS threads)             Emscripten pthreads (Web Workers
+  │ Threads │         4 domains: libtorrent, alert,            + SharedArrayBuffer)
+  │         │         io_context, caller                       + byte reader JS Worker
+  └─────────┘
+                      WHY: OS provides real threads             WHY: browser threads = Web Workers.
+                                                               SharedArrayBuffer for shared memory.
+                                                               COOP/COEP headers required
+
+  ┌─────────┐         real filesystem + SQLite WAL             Emscripten MEMFS (RAM)
+  │ Storage │         LRU eviction, persists across sessions   lost on page refresh
+  └─────────┘
+                      WHY: the app has a writable               WHY: no real filesystem. MEMFS is an
+                      document directory                        in-memory emulation. (IDBFS for
+                                                               persistence is possible but not wired)
+
+  ┌─────────┐         media_kit (libmpv) — SsVideoPlayer      HTML5 <video> — SsVideoPlayerWeb
+  │ Player  │         SsSeekControls (slider, timestamps)      native browser controls
+  └─────────┘
+                      WHY: OS process can embed mpv             WHY: no native video decoder in WASM.
+                      via platform view                        Browser's <video> already decodes MP4,
+                                                               WebM, etc. natively
+
+  ┌─────────┐         ss_read_bytes(engine, id, fi,            ss_read_bytes_wasm(engine, id, fi,
+  │ uint64  │           offset, length, buf, out_n)              off_lo, off_hi, len_lo, len_hi,
+  │ ABI     │                                                    buf, out_n)
+  └─────────┘
+                      WHY: 64-bit pointers, uint64_t            WHY: WASM is 32-bit. uint64_t VALUE
+                      passes in one register                    params are split into two i32s by the
+                                                               ABI. cwrap('number') only passes one
+                                                               → all subsequent params shift → crash.
+                                                               Wrapper with explicit (lo, hi) pairs
+```
+
+**What stays identical across both:** `SeekServeEngine`, `TorrentSessionManager`, `MetadataCatalog`, `PieceAvailabilityIndex`, `StreamingScheduler`, `ByteRangeMapper`, `ByteSource`, `OfflineCacheManager`, `AlertDispatcher` — all the same C++ compiled once for ARM (mobile) and once for WASM (web). The Dart UI layer (`flutter_seekserve_ui`) is also 100% shared; only 5 conditional-import split points handle the platform boundary (see [Conditional Import System](#conditional-import-system)).
 
 ### How It Works
 
