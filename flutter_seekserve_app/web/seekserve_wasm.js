@@ -9,6 +9,12 @@
 let _module = null;
 let _cw = {};
 
+// --- OPFS Worker ---
+let _opfsWorker = null;
+let _opfsAvailable = false;
+let _opfsMsgId = 0;
+const _opfsPending = new Map();
+
 /**
  * Initialise the WASM module.
  * @param {string} wasmBaseUrl - Base URL for .wasm/.worker.js files.
@@ -42,6 +48,71 @@ async function _initSeekServe(wasmBaseUrl) {
     try { FS.mkdir('/seekserve'); } catch (e) { /* already exists */ }
   }
 
+  // --- OPFS Worker init ---
+  try {
+    _opfsWorker = new Worker('seekserve_opfs.js');
+    _opfsWorker.onmessage = (e) => {
+      const msg = e.data;
+      const resolve = _opfsPending.get(msg.msgId);
+      if (resolve) {
+        _opfsPending.delete(msg.msgId);
+        resolve(msg);
+      }
+    };
+    // Test OPFS availability
+    const testResult = await _postToOpfs({ type: 'list' });
+    _opfsAvailable = testResult.ok;
+    console.log('[SeekServe] OPFS available:', _opfsAvailable);
+  } catch (e) {
+    console.warn('[SeekServe] OPFS not available:', e.message || e);
+    _opfsAvailable = false;
+  }
+
+  // --- OPFS → MEMFS boot restore ---
+  if (_opfsAvailable) {
+    try {
+      const stored = await _postToOpfs({ type: 'list' });
+      if (stored.ok && stored.data && stored.data.length > 0) {
+        console.log('[SeekServe] Restoring', stored.data.length, 'file(s) from OPFS to MEMFS');
+        for (const file of stored.data) {
+          // Read __meta.json to get the correct MEMFS path
+          const metaResult = await _postToOpfs({
+            type: 'readMeta',
+            torrentId: file.torrentId,
+          });
+          let memfsPath;
+          if (metaResult.ok && metaResult.meta && metaResult.meta.memfsPath) {
+            memfsPath = metaResult.meta.memfsPath;
+          } else {
+            // Fallback: skip files without metadata (can't determine correct path)
+            console.warn('[SeekServe] No __meta.json for', file.torrentId, '— skipping restore');
+            continue;
+          }
+
+          const result = await _postToOpfs({
+            type: 'restore',
+            torrentId: file.torrentId,
+            fileIndex: file.fileIndex,
+          });
+          if (result.ok && result.data) {
+            // Create directory tree recursively
+            _ensureDir(FS, memfsPath);
+            try {
+              const fd = FS.open(memfsPath, 'w');
+              FS.write(fd, result.data, 0, result.data.length, 0);
+              FS.close(fd);
+              console.log('[SeekServe] OPFS restored:', memfsPath, '(' + result.data.length + ' bytes)');
+            } catch (e) {
+              console.warn('[SeekServe] OPFS restore write failed:', memfsPath, e);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[SeekServe] OPFS boot restore failed:', e);
+    }
+  }
+
   _cw = {
     ss_engine_create: _module.cwrap('ss_engine_create', 'number', ['string']),
     ss_engine_destroy: _module.cwrap('ss_engine_destroy', null, ['number']),
@@ -60,6 +131,23 @@ async function _initSeekServe(wasmBaseUrl) {
     ss_read_bytes_wasm: _module.cwrap('ss_read_bytes_wasm', 'number', ['number', 'string', 'number', 'number', 'number', 'number', 'number', 'number', 'number']),
     ss_get_file_size: _module.cwrap('ss_get_file_size', 'number', ['number', 'string', 'number', 'number']),
   };
+}
+
+// --- FS helpers ---
+
+/**
+ * Recursively create all directories in a file path.
+ * e.g. _ensureDir(FS, "/seekserve/Sintel/video.mp4") creates /seekserve and /seekserve/Sintel.
+ */
+function _ensureDir(FS, filePath) {
+  const parts = filePath.split('/').filter(Boolean);
+  // Remove the filename (last part)
+  parts.pop();
+  let current = '';
+  for (const part of parts) {
+    current += '/' + part;
+    try { FS.mkdir(current); } catch (e) { /* already exists */ }
+  }
 }
 
 // --- String helpers ---
@@ -226,6 +314,255 @@ function getFileSize(engine, torrentId, fileIndex) {
   return { error: 0, size: sizeLo + sizeHi * 0x100000000 };
 }
 
+// --- OPFS helpers ---
+
+/**
+ * Send a message to the OPFS Worker and wait for a response.
+ * @param {Object} msg - Message object with `type` and params.
+ * @returns {Promise<Object>} Response from OPFS Worker.
+ */
+function _postToOpfs(msg) {
+  if (!_opfsWorker) return Promise.resolve({ ok: false, error: 'no-worker' });
+  return new Promise((resolve) => {
+    const id = ++_opfsMsgId;
+    msg.msgId = id;
+    _opfsPending.set(id, resolve);
+    // Transfer Uint8Array buffers if present
+    const transfer = [];
+    if (msg.data instanceof Uint8Array) {
+      transfer.push(msg.data.buffer);
+    }
+    _opfsWorker.postMessage(msg, transfer);
+  });
+}
+
+/**
+ * Persist a piece to OPFS. Called from the piece_finished event handler.
+ * Reads piece data from MEMFS and sends it to the OPFS Worker.
+ */
+function opfsWritePiece(torrentId, fileIndex, pieceOffset, pieceLength, memfsPath) {
+  if (!_opfsAvailable || !_opfsWorker || !_module) return;
+  try {
+    const FS = _module.FS;
+    const fd = FS.open(memfsPath, 'r');
+    const buf = new Uint8Array(pieceLength);
+    FS.read(fd, buf, 0, pieceLength, pieceOffset);
+    FS.close(fd);
+
+    // Fire-and-forget: transfer buffer to worker (no copy)
+    _postToOpfs({
+      type: 'writePiece',
+      torrentId: torrentId,
+      fileIndex: fileIndex,
+      offset: pieceOffset,
+      data: buf,
+    });
+  } catch (e) {
+    // File may not exist yet if piece is before selected file range
+  }
+}
+
+/**
+ * Download a completed file from OPFS to the user's filesystem.
+ * Uses createObjectURL + <a download> trick.
+ * @returns {Promise<boolean>} true if download initiated
+ */
+async function downloadFile(torrentId, fileIndex, fileName) {
+  if (!_opfsAvailable || !_opfsWorker) {
+    throw new Error('OPFS not available');
+  }
+  const result = await _postToOpfs({ type: 'getFile', torrentId, fileIndex });
+  if (!result.ok) throw new Error(result.error || 'getFile failed');
+
+  const url = URL.createObjectURL(result.file);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName || ('file_' + fileIndex);
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  return true;
+}
+
+// --- OPFS Polling Sync ---
+
+let _opfsSyncState = null; // { engine, torrentId, fileIndex, memfsPath, fileSize, pieceLength, firstPiece, endPiece, syncedPieces: Set }
+let _opfsSyncTimer = null;
+let _opfsSyncCycle = 0;
+
+/**
+ * Start periodic OPFS sync for a selected file.
+ * Polls getPieces() every 3s, diffs bitfield, writes new pieces from MEMFS to OPFS.
+ */
+function opfsStartSync(engine, torrentId, fileIndex) {
+  // Stop any existing sync
+  opfsStopSync();
+
+  if (!_opfsAvailable || !_opfsWorker || !_module) return;
+
+  // Gather metadata for the file
+  const piecesResult = getPieces(engine, torrentId);
+  if (piecesResult.error !== 0 || !piecesResult.json) return;
+  const piecesData = JSON.parse(piecesResult.json);
+
+  const filesResult = listFiles(engine, torrentId);
+  if (filesResult.error !== 0 || !filesResult.json) return;
+  const filesData = JSON.parse(filesResult.json);
+
+  const sizeResult = getFileSize(engine, torrentId, fileIndex);
+  if (sizeResult.error !== 0) return;
+
+  // Find file info from pieces data
+  const fileInfo = piecesData.files
+    ? piecesData.files.find(f => f.index === fileIndex)
+    : null;
+  if (!fileInfo) return;
+
+  // Get file path from listFiles
+  const filesList = filesData.files || filesData;
+  const fileEntry = Array.isArray(filesList)
+    ? filesList.find(f => f.index === fileIndex)
+    : null;
+  if (!fileEntry) return;
+
+  const memfsPath = '/seekserve/' + fileEntry.path;
+  const fileSize = sizeResult.size;
+  const pieceLength = piecesData.piece_length;
+  const firstPiece = fileInfo.first_piece;
+  const endPiece = fileInfo.end_piece;
+
+  _opfsSyncState = {
+    engine, torrentId, fileIndex,
+    memfsPath, fileSize, pieceLength,
+    firstPiece, endPiece,
+    syncedPieces: new Set(),
+  };
+  _opfsSyncCycle = 0;
+
+  // Init OPFS file handle
+  _postToOpfs({
+    type: 'init',
+    torrentId: torrentId,
+    fileIndex: fileIndex,
+    fileSize: fileSize,
+  });
+
+  // Save metadata for boot restore
+  _postToOpfs({
+    type: 'writeMeta',
+    torrentId: torrentId,
+    meta: { memfsPath, fileSize, pieceLength, firstPiece, endPiece },
+  });
+
+  console.log('[SeekServe] OPFS sync started:', torrentId, 'file', fileIndex,
+    'pieces', firstPiece, '-', endPiece, 'path:', memfsPath);
+
+  // Start polling
+  _opfsSyncTimer = setInterval(_opfsSyncPieces, 3000);
+}
+
+function opfsStopSync() {
+  if (_opfsSyncTimer) {
+    clearInterval(_opfsSyncTimer);
+    _opfsSyncTimer = null;
+  }
+  if (_opfsSyncState) {
+    // Final flush
+    _postToOpfs({
+      type: 'flush',
+      torrentId: _opfsSyncState.torrentId,
+      fileIndex: _opfsSyncState.fileIndex,
+    });
+    _opfsSyncState = null;
+  }
+}
+
+function _opfsSyncPieces() {
+  if (!_opfsSyncState || !_module) return;
+  const s = _opfsSyncState;
+
+  try {
+    // Get current bitfield
+    const piecesResult = getPieces(s.engine, s.torrentId);
+    if (piecesResult.error !== 0 || !piecesResult.json) return;
+    const piecesData = JSON.parse(piecesResult.json);
+    const bitfield = piecesData.bitfield;
+    if (!bitfield) return;
+
+    const FS = _module.FS;
+    let wrote = 0;
+
+    for (let p = s.firstPiece; p < s.endPiece; p++) {
+      if (s.syncedPieces.has(p)) continue;
+      if (!_bitfieldHasPiece(bitfield, p)) continue;
+
+      // This piece is complete and not yet synced
+      const fileOffset = (p - s.firstPiece) * s.pieceLength;
+      const actualLen = Math.min(s.pieceLength, s.fileSize - fileOffset);
+      if (actualLen <= 0) continue;
+
+      try {
+        const fd = FS.open(s.memfsPath, 'r');
+        const buf = new Uint8Array(actualLen);
+        FS.read(fd, buf, 0, actualLen, fileOffset);
+        FS.close(fd);
+
+        _postToOpfs({
+          type: 'writePiece',
+          torrentId: s.torrentId,
+          fileIndex: s.fileIndex,
+          offset: fileOffset,
+          data: buf,
+        });
+        s.syncedPieces.add(p);
+        wrote++;
+      } catch (e) {
+        // File may not exist yet in MEMFS
+        break;
+      }
+    }
+
+    if (wrote > 0) {
+      console.log('[SeekServe] OPFS synced', wrote, 'piece(s), total:', s.syncedPieces.size,
+        '/', (s.endPiece - s.firstPiece));
+    }
+
+    // Flush every ~30s (10 cycles * 3s)
+    _opfsSyncCycle++;
+    if (_opfsSyncCycle % 10 === 0) {
+      _postToOpfs({
+        type: 'flush',
+        torrentId: s.torrentId,
+        fileIndex: s.fileIndex,
+      });
+      // Also persist SQLite resume_data to IndexedDB
+      syncFs();
+    }
+  } catch (e) {
+    console.warn('[SeekServe] OPFS sync error:', e);
+  }
+}
+
+/**
+ * Check if a piece is set in a hex-encoded bitfield string.
+ * @param {string} hex - Hex-encoded bitfield (e.g. "ff00...")
+ * @param {number} piece - Piece index
+ * @returns {boolean}
+ */
+function _bitfieldHasPiece(hex, piece) {
+  const byteIndex = piece >> 3;
+  const bitIndex = 7 - (piece & 7);
+  const charIndex = byteIndex * 2;
+  if (charIndex + 1 >= hex.length) return false;
+  const byte = parseInt(hex.substr(charIndex, 2), 16);
+  return ((byte >> bitIndex) & 1) === 1;
+}
+
+function opfsAvailable() {
+  return _opfsAvailable;
+}
+
 /**
  * Flush MEMFS changes to IndexedDB (IDBFS persist).
  * Call after any operation that mutates the SQLite DB (add/remove torrent).
@@ -262,4 +599,10 @@ window.SeekServeWasm = {
   getFileSize: getFileSize,
   syncFs: syncFs,
   module: () => _module,
+  // OPFS persistence
+  opfsAvailable: opfsAvailable,
+  opfsWritePiece: opfsWritePiece,
+  opfsStartSync: opfsStartSync,
+  opfsStopSync: opfsStopSync,
+  downloadFile: downloadFile,
 };

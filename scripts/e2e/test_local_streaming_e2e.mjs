@@ -41,7 +41,7 @@ async function discoverWsUrl() {
       res.on('end', () => {
         try {
           const pages = JSON.parse(data);
-          const page = pages.find(p => p.type === 'page' && p.url.includes('localhost'));
+          const page = pages.find(p => p.type === 'page' && (p.url.includes('localhost') || p.url.includes('127.0.0.1')));
           if (!page) reject(new Error('No matching page. Pages: ' + JSON.stringify(pages.map(p => p.url))));
           else resolve(page.webSocketDebuggerUrl);
         } catch (e) { reject(e); }
@@ -170,7 +170,7 @@ async function main() {
 
   // Navigate to app if not already there
   const pageUrl = await evaluate(ws, 'location.href');
-  if (!pageUrl.includes('localhost:8080')) {
+  if (!pageUrl.includes('localhost:8080') && !pageUrl.includes('127.0.0.1:8080')) {
     info(`Current URL: ${pageUrl}, navigating to app...`);
     await sendCommand(ws, 'Page.navigate', { url: APP_URL });
     await sleep(5000);

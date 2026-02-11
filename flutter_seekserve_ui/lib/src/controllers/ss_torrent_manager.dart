@@ -104,7 +104,7 @@ class SsTorrentManager extends ChangeNotifier {
       _eventSub = _client!.events.listen(_onEvent, onError: _onEventError);
 
       _pollTimer = Timer.periodic(
-        const Duration(seconds: 1),
+        const Duration(seconds: 2),
         (_) => _pollStatus(),
       );
 
@@ -238,6 +238,8 @@ class SsTorrentManager extends ChangeNotifier {
       case FileCompleted(:final torrentId, :final fileIndex):
         debugPrint('File completed: $torrentId file $fileIndex');
         _safeNotify();
+      case PieceFinished():
+        break;
       case TorrentError(:final torrentId, :final message):
         _errorMessage = 'Torrent $torrentId: $message';
         _safeNotify();

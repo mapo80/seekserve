@@ -2,6 +2,7 @@
 
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/load_torrent.hpp>
+#include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/session_params.hpp>
 #include <libtorrent/alert_types.hpp>
@@ -58,10 +59,10 @@ lt::settings_pack TorrentSessionManager::make_settings(const SessionConfig& conf
 
 #ifdef TORRENT_USE_RTC
     if (config.enable_webtorrent) {
-        // Browser RTCPeerConnection API requires "stun:" URL scheme prefix.
-        // datachannel-wasm passes the URL as-is to the browser (Dummy IceServer type).
-        sp.set_str(lt::settings_pack::webtorrent_stun_server, "stun:stun.l.google.com:19302");
-        spdlog::info("WebTorrent enabled (STUN: stun:stun.l.google.com:19302)");
+        if (!config.stun_server.empty()) {
+            sp.set_str(lt::settings_pack::webtorrent_stun_server, config.stun_server);
+        }
+        spdlog::info("WebTorrent enabled (STUN: {})", config.stun_server.empty() ? "(none)" : config.stun_server);
     }
 #endif
 
@@ -71,19 +72,33 @@ lt::settings_pack TorrentSessionManager::make_settings(const SessionConfig& conf
 Result<TorrentId> TorrentSessionManager::add_torrent(const AddTorrentParams& params) {
     lt::add_torrent_params atp;
 
-    if (params.uri.substr(0, 7) == "magnet:") {
+    if (!params.resume_data.empty()) {
         lt::error_code ec;
-        lt::parse_magnet_uri(params.uri, atp, ec);
+        atp = lt::read_resume_data(params.resume_data, ec);
         if (ec) {
-            spdlog::error("Failed to parse magnet URI: {}", ec.message());
-            return make_error_code(errc::invalid_argument);
+            spdlog::warn("Failed to read resume data: {}, falling back to URI", ec.message());
+            atp = {};
+        } else {
+            spdlog::info("TorrentSessionManager: using resume data");
         }
-    } else {
-        lt::error_code ec;
-        atp = lt::load_torrent_file(params.uri, ec, lt::load_torrent_limits{});
-        if (ec) {
-            spdlog::error("Failed to load .torrent file '{}': {}", params.uri, ec.message());
-            return make_error_code(errc::invalid_argument);
+    }
+
+    // If resume data wasn't provided or failed to parse, use URI
+    if (!atp.ti && atp.info_hashes == lt::info_hash_t{}) {
+        if (params.uri.substr(0, 7) == "magnet:") {
+            lt::error_code ec;
+            lt::parse_magnet_uri(params.uri, atp, ec);
+            if (ec) {
+                spdlog::error("Failed to parse magnet URI: {}", ec.message());
+                return make_error_code(errc::invalid_argument);
+            }
+        } else {
+            lt::error_code ec;
+            atp = lt::load_torrent_file(params.uri, ec, lt::load_torrent_limits{});
+            if (ec) {
+                spdlog::error("Failed to load .torrent file '{}': {}", params.uri, ec.message());
+                return make_error_code(errc::invalid_argument);
+            }
         }
     }
 

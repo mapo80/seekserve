@@ -112,12 +112,15 @@ private:
 
     std::unordered_map<TorrentId, std::unique_ptr<TorrentState>> states_;
     std::unordered_set<TorrentId> removed_ids_;  // guards alert handlers against late alerts
+    std::unordered_map<TorrentId, FileIndex> pending_file_selections_;  // deferred select_file on restore
     mutable std::mutex mu_;
 
     EventCallback event_cb_;
     mutable std::mutex event_mu_;
+    std::atomic<bool> has_event_cb_{false};  // fast-path check without locking event_mu_
 
     std::atomic<bool> server_running_{false};
+    int resume_save_counter_{0};
 
 #ifdef __EMSCRIPTEN__
     // On Emscripten, handle.status() is a sync_call that can deadlock when

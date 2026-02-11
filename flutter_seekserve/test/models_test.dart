@@ -168,6 +168,37 @@ void main() {
       expect(fc.fileIndex, 3);
     });
 
+    test('parses piece_finished with offset and length', () {
+      final event = SeekServeEvent.fromJson({
+        'type': 'piece_finished',
+        'data': {
+          'torrent_id': 'abc123',
+          'piece_index': 42,
+          'piece_offset': 10485760,
+          'piece_length': 262144,
+        },
+      });
+      expect(event, isA<PieceFinished>());
+      final pf = event as PieceFinished;
+      expect(pf.torrentId, 'abc123');
+      expect(pf.pieceIndex, 42);
+      expect(pf.pieceOffset, 10485760);
+      expect(pf.pieceLength, 262144);
+    });
+
+    test('parses piece_finished with missing optional fields', () {
+      final event = SeekServeEvent.fromJson({
+        'type': 'piece_finished',
+        'data': {'torrent_id': 'xyz'},
+      });
+      expect(event, isA<PieceFinished>());
+      final pf = event as PieceFinished;
+      expect(pf.torrentId, 'xyz');
+      expect(pf.pieceIndex, -1);
+      expect(pf.pieceOffset, 0);
+      expect(pf.pieceLength, 0);
+    });
+
     test('parses error', () {
       final event = SeekServeEvent.fromJson({
         'type': 'error',

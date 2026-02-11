@@ -5,11 +5,12 @@
 # Press Ctrl+C to stop everything.
 #
 # Usage:
-#   ./scripts/run_local_e2e.sh [--build] [--e2e] [--screenshots]
+#   ./scripts/run_local_e2e.sh [--build] [--e2e] [--opfs] [--screenshots]
 #
 # Options:
 #   --build        Build native + Flutter web before running
 #   --e2e          Run automated CDP E2E test instead of waiting
+#   --opfs         Run OPFS persistence E2E test (implies --e2e)
 #   --screenshots  Take screenshots after E2E test (implies --e2e)
 #
 # Prerequisites:
@@ -32,12 +33,14 @@ VIDEO_NAME="bbb_sunflower_1080p_30fps_normal.mp4"
 
 DO_BUILD=false
 DO_E2E=false
+DO_OPFS=false
 DO_SCREENSHOTS=false
 
 for arg in "$@"; do
     case "$arg" in
         --build) DO_BUILD=true ;;
         --e2e) DO_E2E=true ;;
+        --opfs) DO_OPFS=true; DO_E2E=true ;;
         --screenshots) DO_SCREENSHOTS=true; DO_E2E=true ;;
         *) echo "Unknown option: $arg"; exit 1 ;;
     esac
@@ -76,6 +79,8 @@ for p in $TRACKER_PORT $WEB_PORT $CDP_PORT; do
 done
 # Clean stale Chrome profile to avoid cached bad Service Workers
 rm -rf /tmp/chrome-e2e-local 2>/dev/null || true
+# Clean stale seeder cache to avoid double-add from resume data
+rm -f /tmp/seekserve_seeder_cache.db /tmp/seekserve_seeder_cache.db-wal /tmp/seekserve_seeder_cache.db-shm 2>/dev/null || true
 sleep 1
 
 # ============================================================
@@ -249,13 +254,17 @@ fi
 
 echo ""
 echo "=== Step 5: Launch Chrome ==="
+# Disable STUN on browser side for local testing — Chrome's clean profile
+# often fails DNS for stun.l.google.com via P2P sockets. For localhost
+# WebRTC, host ICE candidates are sufficient (no NAT traversal needed).
 "$CHROME" \
     --remote-debugging-port="$CDP_PORT" \
     --user-data-dir=/tmp/chrome-e2e-local \
     --no-first-run \
     --no-default-browser-check \
     --disable-extensions \
-    "http://127.0.0.1:${WEB_PORT}/" &
+    --disable-features=WebRtcHideLocalIpsWithMdns \
+    "http://127.0.0.1:${WEB_PORT}/?stun_server=" &
 PIDS+=($!)
 sleep 5
 echo "  Chrome PID: ${PIDS[${#PIDS[@]}-1]}"
@@ -269,6 +278,16 @@ if [ "$DO_E2E" = true ]; then
     echo "=== Step 6: Run E2E test ==="
     cd "$ROOT_DIR"
     node "$ROOT_DIR/scripts/e2e/test_local_streaming_e2e.mjs" "$MAGNET"
+
+    if [ "$DO_OPFS" = true ]; then
+        echo ""
+        echo "=== Step 6b: Run OPFS Worker isolation test ==="
+        node "$ROOT_DIR/scripts/e2e/test_opfs_worker.mjs"
+
+        echo ""
+        echo "=== Step 6c: Run OPFS persistence E2E test ==="
+        node "$ROOT_DIR/scripts/e2e/test_opfs_persistence_e2e.mjs" "$MAGNET"
+    fi
 
     if [ "$DO_SCREENSHOTS" = true ]; then
         echo ""

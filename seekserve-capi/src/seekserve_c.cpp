@@ -72,6 +72,8 @@ static seekserve::SeekServeEngine::Config parse_config(const char* config_json) 
             else if (level == "error") spdlog::set_level(spdlog::level::err);
             else spdlog::set_level(spdlog::level::info);
         }
+        if (j.contains("stun_server"))
+            config.session.stun_server = j["stun_server"].get<std::string>();
         if (j.contains("extra_trackers")) {
             config.session.extra_trackers.clear();
             for (const auto& t : j["extra_trackers"]) {

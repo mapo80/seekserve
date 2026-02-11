@@ -10,6 +10,7 @@ class SeekServeConfig {
   final String? cacheDbPath;
   final String? logLevel;
   final bool? enableWebtorrent;
+  final String? stunServer;
   final List<String>? extraTrackers;
 
   const SeekServeConfig({
@@ -21,6 +22,7 @@ class SeekServeConfig {
     this.cacheDbPath,
     this.logLevel,
     this.enableWebtorrent,
+    this.stunServer,
     this.extraTrackers,
   });
 
@@ -35,6 +37,7 @@ class SeekServeConfig {
     if (cacheDbPath != null) map['cache_db_path'] = cacheDbPath;
     if (logLevel != null) map['log_level'] = logLevel;
     if (enableWebtorrent != null) map['enable_webtorrent'] = enableWebtorrent;
+    if (stunServer != null) map['stun_server'] = stunServer;
     if (extraTrackers != null) map['extra_trackers'] = extraTrackers;
     return jsonEncode(map);
   }

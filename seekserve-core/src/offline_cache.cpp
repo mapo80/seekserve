@@ -67,6 +67,12 @@ void OfflineCacheManager::init_db() {
         spdlog::error("OfflineCacheManager: failed to create torrents table: {}", err ? err : "unknown");
         sqlite3_free(err);
     }
+
+    // Migrate: add resume_data and selected_file columns if missing
+    sqlite3_exec(db_, "ALTER TABLE torrents ADD COLUMN resume_data BLOB;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE torrents ADD COLUMN selected_file INTEGER DEFAULT -1;",
+                 nullptr, nullptr, nullptr);
 }
 
 static std::int64_t now_epoch() {
@@ -343,6 +349,103 @@ std::vector<std::pair<TorrentId, std::string>> OfflineCacheManager::list_torrent
         auto tid = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
         auto uri = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
         result.emplace_back(std::move(tid), std::move(uri));
+    }
+
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+void OfflineCacheManager::save_resume_data(const TorrentId& id, const std::vector<char>& data) {
+    std::lock_guard lock(mu_);
+    if (!db_) return;
+
+    const char* sql = R"(
+        UPDATE torrents SET resume_data = ? WHERE torrent_id = ?;
+    )";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("OfflineCacheManager: prepare failed: {}", sqlite3_errmsg(db_));
+        return;
+    }
+
+    sqlite3_bind_blob(stmt, 1, data.data(), static_cast<int>(data.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, id.c_str(), static_cast<int>(id.size()), SQLITE_TRANSIENT);
+
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+std::vector<char> OfflineCacheManager::load_resume_data(const TorrentId& id) const {
+    std::lock_guard lock(mu_);
+    if (!db_) return {};
+
+    const char* sql = R"(
+        SELECT resume_data FROM torrents WHERE torrent_id = ?;
+    )";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return {};
+
+    sqlite3_bind_text(stmt, 1, id.c_str(), static_cast<int>(id.size()), SQLITE_TRANSIENT);
+
+    std::vector<char> result;
+    if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+        auto blob = static_cast<const char*>(sqlite3_column_blob(stmt, 0));
+        auto size = sqlite3_column_bytes(stmt, 0);
+        result.assign(blob, blob + size);
+    }
+
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+void OfflineCacheManager::save_selected_file(const TorrentId& id, FileIndex fi) {
+    std::lock_guard lock(mu_);
+    if (!db_) return;
+
+    const char* sql = R"(
+        UPDATE torrents SET selected_file = ? WHERE torrent_id = ?;
+    )";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("OfflineCacheManager: prepare failed: {}", sqlite3_errmsg(db_));
+        return;
+    }
+
+    sqlite3_bind_int(stmt, 1, fi);
+    sqlite3_bind_text(stmt, 2, id.c_str(), static_cast<int>(id.size()), SQLITE_TRANSIENT);
+
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+std::vector<SavedTorrent> OfflineCacheManager::list_saved_torrents() const {
+    std::lock_guard lock(mu_);
+    std::vector<SavedTorrent> result;
+    if (!db_) return result;
+
+    const char* sql = R"(
+        SELECT torrent_id, uri, resume_data, selected_file FROM torrents ORDER BY added_at;
+    )";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return result;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        SavedTorrent t;
+        t.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        t.uri = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+
+        if (sqlite3_column_type(stmt, 2) != SQLITE_NULL) {
+            auto blob = static_cast<const char*>(sqlite3_column_blob(stmt, 2));
+            auto size = sqlite3_column_bytes(stmt, 2);
+            t.resume_data.assign(blob, blob + size);
+        }
+
+        t.selected_file = sqlite3_column_int(stmt, 3);
+        result.push_back(std::move(t));
     }
 
     sqlite3_finalize(stmt);

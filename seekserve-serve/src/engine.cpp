@@ -7,6 +7,7 @@
 #include <libtorrent/hex.hpp>
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/file_storage.hpp>
+#include <libtorrent/write_resume_data.hpp>
 
 #ifdef __EMSCRIPTEN__
 #include <boost/asio/post.hpp>
@@ -26,16 +27,22 @@ SeekServeEngine::SeekServeEngine(const Config& config)
     cache_ = std::make_unique<OfflineCacheManager>(config_.cache);
     wire_alerts();
 
-    // Auto-restore persisted torrents
-    auto saved = cache_->list_torrent_uris();
-    for (const auto& [id, uri] : saved) {
+    // Auto-restore persisted torrents (with resume data if available)
+    auto saved = cache_->list_saved_torrents();
+    for (const auto& t : saved) {
         AddTorrentParams atp;
-        atp.uri = uri;
+        atp.uri = t.uri;
         atp.save_path = config_.session.save_path;
+        atp.resume_data = t.resume_data;
         auto result = sessions_->add_torrent(atp);
         if (!result) {
-            spdlog::warn("Engine: failed to restore torrent {}: {}", id, result.error().message());
-            cache_->remove_torrent_uri(id);
+            spdlog::warn("Engine: failed to restore torrent {}: {}", t.id, result.error().message());
+            cache_->remove_torrent_uri(t.id);
+        } else if (t.selected_file >= 0) {
+            // Defer auto-select: metadata may not be ready yet.
+            // Store the pending selection; metadata_received handler will apply it.
+            std::lock_guard lock(mu_);
+            pending_file_selections_[t.id] = t.selected_file;
         }
     }
     if (!saved.empty()) {
@@ -108,6 +115,23 @@ void SeekServeEngine::wire_alerts() {
                 }
 
                 fire_event("metadata_received", "{\"torrent_id\":\"" + id + "\"}");
+
+                // Apply pending file selection from restore
+                FileIndex pending_fi = -1;
+                {
+                    std::lock_guard lock2(mu_);
+                    auto pit = pending_file_selections_.find(id);
+                    if (pit != pending_file_selections_.end()) {
+                        pending_fi = pit->second;
+                        pending_file_selections_.erase(pit);
+                    }
+                }
+                if (pending_fi >= 0) {
+                    auto sel_result = select_file(id, pending_fi);
+                    if (sel_result) {
+                        spdlog::info("Engine: auto-selected file {} for restored torrent {}", pending_fi, id);
+                    }
+                }
             });
 #else
             auto ti = a.handle.torrent_file();
@@ -128,6 +152,25 @@ void SeekServeEngine::wire_alerts() {
             }
 
             fire_event("metadata_received", "{\"torrent_id\":\"" + id + "\"}");
+
+            // Apply pending file selection from restore
+            {
+                FileIndex pending_fi = -1;
+                {
+                    std::lock_guard lock2(mu_);
+                    auto pit = pending_file_selections_.find(id);
+                    if (pit != pending_file_selections_.end()) {
+                        pending_fi = pit->second;
+                        pending_file_selections_.erase(pit);
+                    }
+                }
+                if (pending_fi >= 0) {
+                    auto sel_result = select_file(id, pending_fi);
+                    if (sel_result) {
+                        spdlog::info("Engine: auto-selected file {} for restored torrent {}", pending_fi, id);
+                    }
+                }
+            }
 #endif
         });
 
@@ -175,7 +218,7 @@ void SeekServeEngine::wire_alerts() {
 #endif
         });
 
-    // piece_finished_alert → availability + scheduler + byte_source
+    // piece_finished_alert → availability + scheduler + byte_source + event
     sessions_->alert_dispatcher().on<lt::piece_finished_alert>(
         [this](const lt::piece_finished_alert& a) {
 #ifdef __EMSCRIPTEN__
@@ -198,6 +241,26 @@ void SeekServeEngine::wire_alerts() {
                 state->avail.mark_complete(piece);
                 if (state->source) state->source->notify_piece_complete();
                 if (state->scheduler) state->scheduler->on_piece_complete(piece);
+            }
+
+            // Fire event with piece offset/length for OPFS persistence.
+            // Fast-path: skip JSON construction when no callback is registered
+            // (avoids ~30 string allocs/sec under mu_ lock).
+            if (has_event_cb_.load(std::memory_order_acquire)) {
+                auto ti = catalog_.torrent_info(id);
+                if (ti) {
+                    int pl = ti->piece_length();
+                    auto total_size = ti->total_size();
+                    auto piece_offset = static_cast<std::int64_t>(piece) * pl;
+                    auto actual_length = std::min(
+                        static_cast<std::int64_t>(pl),
+                        total_size - piece_offset);
+                    fire_event("piece_finished",
+                        "{\"torrent_id\":\"" + id + "\","
+                        "\"piece_index\":" + std::to_string(piece) + ","
+                        "\"piece_offset\":" + std::to_string(piece_offset) + ","
+                        "\"piece_length\":" + std::to_string(actual_length) + "}");
+                }
             }
         });
 
@@ -238,6 +301,25 @@ void SeekServeEngine::wire_alerts() {
             }
         });
 #endif
+
+    // save_resume_data_alert → persist resume data to SQLite
+    sessions_->alert_dispatcher().on<lt::save_resume_data_alert>(
+        [this](const lt::save_resume_data_alert& a) {
+#ifdef __EMSCRIPTEN__
+            auto id = sessions_->id_from_handle(a.handle);
+            if (id.empty()) return;
+#else
+            auto st = a.handle.status(lt::torrent_handle::query_name);
+            auto id = infohash_to_hex(st.info_hashes);
+#endif
+            {
+                std::lock_guard lock(mu_);
+                if (removed_ids_.count(id)) return;
+            }
+            auto buf = lt::write_resume_data_buf(a.params);
+            cache_->save_resume_data(id, buf);
+            spdlog::debug("Engine: saved resume data for {} ({} bytes)", id, buf.size());
+        });
 }
 
 Result<TorrentId> SeekServeEngine::add_torrent(const std::string& uri,
@@ -400,6 +482,7 @@ Result<void> SeekServeEngine::select_file(const TorrentId& id, FileIndex fi) {
         states_[id] = std::move(state);
     }
 
+    cache_->save_selected_file(id, fi);
     return {};
 }
 
@@ -677,6 +760,7 @@ void SeekServeEngine::stop_server() {
 
 void SeekServeEngine::set_event_callback(EventCallback cb) {
     std::lock_guard lock(event_mu_);
+    has_event_cb_.store(cb != nullptr, std::memory_order_release);
     event_cb_ = std::move(cb);
 }
 
@@ -718,6 +802,16 @@ void SeekServeEngine::on_tick(const boost::system::error_code& ec) {
                     ? static_cast<float>(completed) / static_cast<float>(total)
                     : 0.0f;
                 cache_->on_progress_update(id, state->selected_file, progress);
+            }
+        }
+    }
+
+    // Periodically request resume data saves (every 60 ticks = 60s)
+    if (++resume_save_counter_ % 60 == 0) {
+        for (auto& [id, state] : states_) {
+            auto handle = sessions_->get_handle(id);
+            if (handle.is_valid()) {
+                handle.save_resume_data(lt::torrent_handle::save_info_dict);
             }
         }
     }

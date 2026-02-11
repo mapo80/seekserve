@@ -14,6 +14,13 @@ sealed class SeekServeEvent {
           torrentId: data['torrent_id'] as String? ?? '',
           fileIndex: data['file_index'] as int? ?? -1,
         );
+      case 'piece_finished':
+        return PieceFinished(
+          torrentId: data['torrent_id'] as String? ?? '',
+          pieceIndex: data['piece_index'] as int? ?? -1,
+          pieceOffset: data['piece_offset'] as int? ?? 0,
+          pieceLength: data['piece_length'] as int? ?? 0,
+        );
       case 'error':
         return TorrentError(
           torrentId: data['torrent_id'] as String? ?? '',
@@ -29,6 +36,20 @@ sealed class SeekServeEvent {
 class MetadataReceived extends SeekServeEvent {
   final String torrentId;
   const MetadataReceived({required this.torrentId});
+}
+
+/// Fired when a piece finishes downloading.
+class PieceFinished extends SeekServeEvent {
+  final String torrentId;
+  final int pieceIndex;
+  final int pieceOffset;
+  final int pieceLength;
+  const PieceFinished({
+    required this.torrentId,
+    required this.pieceIndex,
+    required this.pieceOffset,
+    required this.pieceLength,
+  });
 }
 
 /// Fired when a file finishes downloading completely.

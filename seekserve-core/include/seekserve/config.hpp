@@ -10,6 +10,7 @@ namespace seekserve {
 struct SessionConfig {
     std::string save_path = "./downloads";
     bool enable_webtorrent = true;
+    std::string stun_server = "stun:stun.l.google.com:19302";
     std::vector<std::string> extra_trackers;
     int listen_port_start = 6881;
     int listen_port_end = 6891;

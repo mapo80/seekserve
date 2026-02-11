@@ -20,6 +20,7 @@ namespace seekserve {
 struct AddTorrentParams {
     std::string uri;              // magnet: URI or .torrent file path
     std::string save_path;        // override default save path (optional)
+    std::vector<char> resume_data;  // libtorrent resume data blob (optional)
 };
 
 class TorrentSessionManager {

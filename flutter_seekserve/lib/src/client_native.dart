@@ -219,6 +219,15 @@ class SeekServeClientNative implements SeekServeClient {
   }
 
   @override
+  bool get isOpfsAvailable => false;
+
+  @override
+  Future<void> downloadFile(
+      String torrentId, int fileIndex, String fileName) async {
+    // No-op on native — files are already on disk.
+  }
+
+  @override
   void dispose() {
     if (_disposed) return;
     _disposed = true;

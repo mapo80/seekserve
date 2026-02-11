@@ -23,6 +23,13 @@ struct CacheEntry {
     std::chrono::system_clock::time_point added;
 };
 
+struct SavedTorrent {
+    TorrentId id;
+    std::string uri;
+    std::vector<char> resume_data;
+    FileIndex selected_file = -1;
+};
+
 class OfflineCacheManager {
 public:
     explicit OfflineCacheManager(const CacheConfig& config);
@@ -44,6 +51,12 @@ public:
     void save_torrent_uri(const TorrentId& id, const std::string& uri);
     void remove_torrent_uri(const TorrentId& id);
     std::vector<std::pair<TorrentId, std::string>> list_torrent_uris() const;
+
+    // Resume data persistence
+    void save_resume_data(const TorrentId& id, const std::vector<char>& data);
+    std::vector<char> load_resume_data(const TorrentId& id) const;
+    void save_selected_file(const TorrentId& id, FileIndex fi);
+    std::vector<SavedTorrent> list_saved_torrents() const;
 
 private:
     void init_db();

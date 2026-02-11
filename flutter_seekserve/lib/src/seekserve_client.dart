@@ -58,6 +58,15 @@ abstract class SeekServeClient {
   /// Returns null if metadata is not yet available.
   PiecesInfo? getPieces(String torrentId);
 
+  /// Whether OPFS (Origin Private File System) is available for piece persistence.
+  /// Always false on native (persistence is handled via the filesystem).
+  bool get isOpfsAvailable => false;
+
+  /// Downloads a completed file to the user's filesystem (web only).
+  /// On native, this is a no-op (files are already on disk).
+  Future<void> downloadFile(
+      String torrentId, int fileIndex, String fileName) async {}
+
   /// Releases all resources.
   void dispose();
 }

@@ -89,8 +89,10 @@ class SeekServeClientWasm implements SeekServeClient {
     _setupSwMessageHandler();
 
     // Start polling for events (metadata changes, etc.)
+    // Poll at 2s — the UI manager also polls status independently,
+    // so higher frequency here just adds cross-thread cwrap overhead.
     _pollTimer?.cancel();
-    _pollTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+    _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       _pollEvents();
     });
 
@@ -141,6 +143,8 @@ class SeekServeClientWasm implements SeekServeClient {
   @override
   void removeTorrent(String torrentId, {bool deleteFiles = false}) {
     _ensureNotDisposed();
+    // Stop OPFS sync before removing
+    try { seekServeWasm.opfsStopSync(); } catch (_) {}
     final err = _jsCall(
       () => seekServeWasm.removeTorrent(
           _engine, torrentId.toJS, deleteFiles.toJS),
@@ -186,6 +190,10 @@ class SeekServeClientWasm implements SeekServeClient {
       'selectFile',
     );
     checkError(err.toDartInt);
+    // Start OPFS persistence sync for the selected file
+    try {
+      seekServeWasm.opfsStartSync(_engine, torrentId.toJS, fileIndex.toJS);
+    } catch (_) {}
   }
 
   @override
@@ -234,11 +242,31 @@ class SeekServeClientWasm implements SeekServeClient {
   }
 
   @override
+  bool get isOpfsAvailable {
+    try {
+      return seekServeWasm.opfsAvailable().toDart;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<void> downloadFile(
+      String torrentId, int fileIndex, String fileName) async {
+    _ensureNotDisposed();
+    await seekServeWasm
+        .downloadFile(torrentId.toJS, fileIndex.toJS, fileName.toJS)
+        .toDart;
+  }
+
+  @override
   void dispose() {
     if (_disposed) return;
     _disposed = true;
     _pollTimer?.cancel();
     _pollTimer = null;
+    // Stop OPFS sync before destroying engine
+    try { seekServeWasm.opfsStopSync(); } catch (_) {}
     _eventController.close();
     try {
       seekServeWasm.engineDestroy(_engine);
