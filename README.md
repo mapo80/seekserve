@@ -1794,6 +1794,63 @@ NATIVE:  Dart → dart:ffi → C API (.so/.a) → Engine → HttpRangeServer →
 WASM:    Dart → dart:js_interop → JS glue → C API (.wasm) → Engine → Service Worker → HTTP URL → <video>
 ```
 
+```
++-----------------------------------------------------------------------+
+|                          Browser (Chrome)                              |
+|                                                                       |
+|  +----------------------------+    +-------------------------------+  |
+|  |  Flutter Web App (Dart)    |    |  HTML5 <video> element        |  |
+|  |                            |    |  src=/seekserve-stream/{id}/{fi}  |
+|  |  SeekServeClientWasm       |    +-------------+-----------------+  |
+|  |   dart:js_interop          |                  |                    |
+|  +--------+-------------------+                  | fetch (Range)      |
+|           |                                      v                    |
+|           | cwrap calls             +----------------------------+    |
+|           v                         |  Service Worker            |    |
+|  +----------------------------+     |  seekserve_sw.js           |    |
+|  |  JS Glue Layer             |     |                            |    |
+|  |  seekserve_wasm.js         |     |  intercepts /seekserve-    |    |
+|  |                            |     |  stream/* URLs             |    |
+|  |  cwrap() wrappers for      |<----+  sends MessageChannel to  |    |
+|  |  all ss_* C API functions  |     |  main thread for bytes     |    |
+|  +--------+-------------------+     |                            |    |
+|           |                         |  returns 206 Partial       |    |
+|           v                         |  Content to <video>        |    |
+|  +----------------------------+     +----------------------------+    |
+|  |  WASM Module               |                                       |
+|  |  seekserve.wasm (4.5 MB)  |                                       |
+|  |                            |                                       |
+|  |  +----------------------+  |     +----------------------------+    |
+|  |  |  SeekServeEngine     |  |     |  Emscripten pthreads       |    |
+|  |  |  (same C++ code)     |  |     |  (Web Workers +            |    |
+|  |  |                      |  |     |   SharedArrayBuffer)        |    |
+|  |  |  SessionManager      |  |     |                            |    |
+|  |  |  MetadataCatalog     |  |     |  libtorrent session thread |    |
+|  |  |  PieceAvailability   |  |     |  AlertDispatcher thread    |    |
+|  |  |  StreamingScheduler  |  |     |  ioc_ (tick timer) thread  |    |
+|  |  |  ByteSource          |  |     +----------------------------+    |
+|  |  |  OfflineCache        |  |                                       |
+|  |  +----------+-----------+  |                                       |
+|  |             |              |                                       |
+|  +-------------|--+-----------+                                       |
+|                |  |                                                    |
+|                v  v                                                    |
+|  +----------------------------+     +----------------------------+    |
+|  |  datachannel-wasm          |     |  WebSocket (ws://)         |    |
+|  |  (browser-native WebRTC)   |     |  tracker connection        |    |
+|  |                            |     |  (wasm_websocket_tracker)  |    |
+|  |  RTCPeerConnection API     |     +-------------+--------------+    |
+|  |  RTCDataChannel API        |                   |                   |
+|  +--------+-------------------+                   |                   |
+|           |                                       |                   |
++-----------+---------------------------------------+-------------------+
+            |                                       |
+            v                                       v
+     WebRTC Data Channels                   WebSocket Tracker
+     (peer-to-peer BitTorrent)              (peer discovery)
+     STUN: stun.l.google.com:19302          ws://tracker.example.com
+```
+
 On the web:
 - **libtorrent** runs as WASM with pthreads (Web Workers + `SharedArrayBuffer`)
 - **WebTorrent** is enabled — uses `datachannel-wasm` (browser-native WebRTC bridge) instead of `libdatachannel`
@@ -1810,6 +1867,155 @@ On the web:
 4. A Service Worker (`seekserve_sw.js`) intercepts fetch requests matching `/seekserve-stream/*`
 5. When the `<video>` element requests a byte range, the Service Worker asks the main thread, which calls into the WASM module, and returns a `206 Partial Content` response
 6. Dart code uses **conditional imports** (`dart.library.js_interop`) to automatically switch between FFI (native) and JS interop (web)
+
+### WASM Thread Model
+
+On native, the engine runs 4 thread domains (see [Thread Model](#thread-model)). On WASM, each pthread is a **Web Worker** with `SharedArrayBuffer` for shared memory. The mapping:
+
+```
++-----------------------------------------------------------------------+
+|                        Browser Thread Layout                           |
++-----------------------------------------------------------------------+
+|                                                                        |
+|  [Main Thread]  (browser UI thread)                                    |
+|      - Flutter Dart app (compiled to JS)                               |
+|      - JS glue layer (seekserve_wasm.js)                               |
+|      - Service Worker MessageChannel handler                           |
+|      - MUST NOT call blocking WASM functions (deadlock)                |
+|                                                                        |
+|  [Web Worker 1]  Emscripten main → PROXY_TO_PTHREAD                   |
+|      - C++ main() runs here (not on browser main thread)               |
+|      - ss_create_engine(), ss_add_torrent(), etc.                      |
+|      - cwrap() calls from JS proxy to this worker                      |
+|                                                                        |
+|  [Web Worker 2]  libtorrent session                                    |
+|      - network I/O (WebRTC data channels via datachannel-wasm)         |
+|      - piece management, peer protocol                                 |
+|      - WebSocket tracker connections                                   |
+|                                                                        |
+|  [Web Worker 3]  AlertDispatcher                                       |
+|      - pop_alerts() loop, 100ms poll                                   |
+|      - fires piece_finished, metadata_received, etc.                   |
+|      - posts deferred work to ioc_ via boost::asio::post()            |
+|                                                                        |
+|  [Web Worker 4]  io_context (tick timer)                               |
+|      - 1s periodic tick (status caching, scheduler)                    |
+|      - deferred metadata/piece work from AlertDispatcher               |
+|      - auto-started in constructor (not start_server)                  |
+|                                                                        |
+|  [Web Worker 5]  Byte reader (seekserve_reader.js)                     |
+|      - dedicated JS worker for blocking ss_read_bytes_wasm()           |
+|      - Service Worker → Main Thread → Reader Worker → WASM            |
+|      - avoids blocking the main thread during video playback           |
+|                                                                        |
++-----------------------------------------------------------------------+
+
+Key differences from native:
+  - No HttpRangeServer (replaced by Service Worker)
+  - No socket I/O (replaced by WebRTC DataChannel + WebSocket)
+  - Status caching: handle.status() deadlocks from main thread
+    → cached via state_update_alert, read from cached_statuses_
+  - id_from_handle(): safe handle→ID lookup without sync_call
+  - uint64_t ABI: WASM is 32-bit, uint64_t VALUE params split
+    into two i32s → ss_read_bytes_wasm() with explicit (lo, hi)
+```
+
+### Service Worker Streaming Flow
+
+```
+<video src="/seekserve-stream/{id}/{fi}">
+    |
+    | fetch event (Range: bytes=X-Y)
+    v
++-------------------------------+
+|  Service Worker               |
+|  seekserve_sw.js              |
+|                               |
+|  1. parse Range header        |
+|  2. compute chunk offset/len  |
++-------+-----------------------+
+        |
+        | MessageChannel postMessage
+        | {type:'seekserve-readBytes', torrentId, fileIndex, offset, length}
+        v
++-------------------------------+
+|  Main Thread (Dart)           |
+|  client_wasm.dart             |
+|  _handleSwReadBytes()         |
+|                               |
+|  calls seekServeWasm          |
+|  .readBytes(engine, ...)      |
++-------+-----------------------+
+        |
+        | cwrap → ss_read_bytes_wasm()
+        v
++-------------------------------+
+|  WASM Module                  |
+|  ss_read_bytes_wasm()         |
+|                               |
+|  ByteSource::read()           |
+|    waits for pieces (cv)      |
+|    reads from MEMFS           |
+|    returns byte[]             |
++-------+-----------------------+
+        |
+        | Uint8Array via MessagePort
+        v
++-------------------------------+
+|  Service Worker               |
+|                               |
+|  new Response(body, {         |
+|    status: 206,               |
+|    headers: {                 |
+|      Content-Range,           |
+|      Content-Length,           |
+|      Content-Type,            |
+|      Accept-Ranges: bytes     |
+|    }                          |
+|  })                           |
++-------------------------------+
+        |
+        | 206 Partial Content
+        v
+    <video> plays
+```
+
+### WebTorrent Browser Pipeline
+
+```
++-------------------+          +--------------------+
+|  WebSocket        |          |  Native Seeder     |
+|  Tracker          |          |  (libdatachannel)  |
+|  ws://tracker:80  |          |                    |
++--------+----------+          +---------+----------+
+         |                               |
+         | announce (offer SDP)          | announce (answer SDP)
+         v                               v
++------------------------------------------------------+
+|                    SDP Exchange                        |
+|  Browser sends offer → tracker → seeder gets offer   |
+|  Seeder sends answer → tracker → browser gets answer |
++------------------------------------------------------+
+         |                               |
+         v                               v
++-------------------+          +--------------------+
+|  Browser Peer     |  WebRTC  |  Native Peer       |
+|  datachannel-wasm |<-------->|  libdatachannel    |
+|                   |  Data    |                    |
+|  RTCPeerConnection|  Channel |  RTCPeerConnection |
++--------+----------+          +--------------------+
+         |
+         | BitTorrent protocol over DataChannel
+         v
++------------------------------------------------------+
+|  libtorrent (WASM)                                    |
+|                                                       |
+|  piece_finished_alert → PieceAvailabilityIndex        |
+|  StreamingScheduler → set_piece_deadline()            |
+|  ByteSource::read() → pieces from MEMFS              |
+|                        → Service Worker → <video>     |
++------------------------------------------------------+
+```
 
 ### Prerequisites
 
