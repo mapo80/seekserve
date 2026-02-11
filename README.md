@@ -1891,12 +1891,14 @@ The C++ engine is the same binary. Everything around it changes because browsers
                                                                SharedArrayBuffer for shared memory.
                                                                COOP/COEP headers required
 
-  ┌─────────┐         real filesystem + SQLite WAL             Emscripten MEMFS (RAM)
-  │ Storage │         LRU eviction, persists across sessions   lost on page refresh
+  ┌─────────┐         real filesystem + SQLite WAL             MEMFS + IDBFS (IndexedDB)
+  │ Storage │         LRU eviction, persists across sessions   SQLite DB persists across refresh
   └─────────┘
-                      WHY: the app has a writable               WHY: no real filesystem. MEMFS is an
-                      document directory                        in-memory emulation. (IDBFS for
-                                                               persistence is possible but not wired)
+                      WHY: the app has a writable               WHY: no real filesystem. Emscripten MEMFS
+                      document directory, journal_mode=WAL      is backed by IDBFS at /seekserve/ — data
+                      for concurrent read/write                 syncs to IndexedDB after add/remove.
+                                                               journal_mode=MEMORY (no WAL on IDBFS).
+                                                               Piece data between syncs is volatile
 
   ┌─────────┐         media_kit (libmpv) — SsVideoPlayer      HTML5 <video> — SsVideoPlayerWeb
   │ Player  │         SsSeekControls (slider, timestamps)      native browser controls
@@ -2192,7 +2194,7 @@ Supported responses: `200 OK` (full file), `206 Partial Content` (range request)
 ### Current Limitations
 
 - **WebTorrent peers only** — browser WASM connects via WebRTC data channels, not standard TCP/UDP BitTorrent. Seeds must have WebTorrent enabled to be reachable.
-- **MEMFS storage** — all downloaded data is in memory (lost on page refresh); IDBFS persistence is not yet wired
+- **Partial piece persistence** — SQLite cache DB persists via IDBFS (IndexedDB), but downloaded piece data only syncs on add/remove torrent, not after each piece — pieces between syncs are lost on refresh
 - **No `SsSeekControls`** — the `media_kit` `Player` type doesn't exist on web; the HTML5 video player has its own built-in controls
 - **COOP/COEP restrictions** — `SharedArrayBuffer` requires strict cross-origin isolation, which may block some third-party resources
 - **Binary size** — the WASM module is ~4-5 MB; consider lazy loading and `-Oz` optimization for production
