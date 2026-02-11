@@ -46,6 +46,9 @@ class _SsVideoPlayerState extends State<SsVideoPlayer> {
   bool _controlsVisible = true;
   Timer? _hideTimer;
   Timer? _pollTimer;
+  Timer? _retryTimer;
+  int _autoRetryCount = 0;
+  static const _maxAutoRetries = 10;
 
   static const _fullscreen = IconData(0xe2cb, fontFamily: 'MaterialIcons');
   static const _fullscreenExit = IconData(0xe2cc, fontFamily: 'MaterialIcons');
@@ -97,7 +100,10 @@ class _SsVideoPlayerState extends State<SsVideoPlayer> {
     video.addEventListener(
       'playing',
       ((web.Event e) {
-        if (mounted) setState(() => _buffering = false);
+        if (mounted) {
+          setState(() => _buffering = false);
+          _autoRetryCount = 0; // Reset on successful playback
+        }
       }).toJS,
     );
     video.addEventListener(
@@ -109,7 +115,24 @@ class _SsVideoPlayerState extends State<SsVideoPlayer> {
     video.addEventListener(
       'error',
       ((web.Event e) {
-        if (mounted) setState(() => _error = 'Video playback error');
+        if (!mounted) return;
+        final me = video.error;
+        final code = me?.code ?? 0;
+        // MediaError codes: 1=ABORTED, 2=NETWORK, 3=DECODE, 4=SRC_NOT_SUPPORTED
+        // Auto-retry NETWORK errors — pieces may not have arrived yet.
+        if (code == 2 && _autoRetryCount < _maxAutoRetries) {
+          _autoRetryCount++;
+          final delay = Duration(seconds: _autoRetryCount.clamp(1, 5));
+          _retryTimer?.cancel();
+          _retryTimer = Timer(delay, () {
+            if (!mounted || _video == null) return;
+            _video!.load();
+            _video!.play();
+          });
+          return;
+        }
+        const names = {1: 'ABORTED', 2: 'NETWORK', 3: 'DECODE', 4: 'SRC_NOT_SUPPORTED'};
+        setState(() => _error = 'Video error: ${names[code] ?? 'UNKNOWN'} ($code)');
       }).toJS,
     );
 
@@ -133,6 +156,7 @@ class _SsVideoPlayerState extends State<SsVideoPlayer> {
   void dispose() {
     _pollTimer?.cancel();
     _hideTimer?.cancel();
+    _retryTimer?.cancel();
     _video?.pause();
     _video = null;
     super.dispose();
@@ -153,6 +177,17 @@ class _SsVideoPlayerState extends State<SsVideoPlayer> {
   }
 
   void _onInteraction() => _scheduleHide();
+
+  void _retry() {
+    final v = _video;
+    if (v == null) return;
+    setState(() {
+      _error = '';
+      _buffering = true;
+    });
+    v.load();
+    v.play();
+  }
 
   void _playPause() {
     final v = _video;
@@ -197,6 +232,23 @@ class _SsVideoPlayerState extends State<SsVideoPlayer> {
                   textAlign: TextAlign.center,
                   maxLines: 3,
                   overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 16),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (widget.isFullscreen)
+                      SsIconButton(
+                        icon: _fullscreenExit,
+                        color: const Color(0xFFFFFFFF),
+                        onPressed: () => widget.onFullscreenToggle?.call(),
+                      ),
+                    SsIconButton(
+                      icon: _playArrow,
+                      color: const Color(0xFFFFFFFF),
+                      onPressed: _retry,
+                    ),
+                  ],
                 ),
               ],
             ),

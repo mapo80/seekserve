@@ -45,7 +45,9 @@ class HttpRangeServerTest : public ::testing::Test {
 protected:
     void SetUp() override {
         // Create temp file
-        tmp_dir_ = std::filesystem::temp_directory_path() / "seekserve_test_http";
+        tmp_dir_ = std::filesystem::temp_directory_path() /
+            ("seekserve_test_http_" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(tmp_dir_);
         file_path_ = (tmp_dir_ / "test.bin").string();
 

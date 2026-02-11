@@ -27,7 +27,7 @@ abstract class SeekServeClient {
   Stream<SeekServeEvent> get events;
 
   /// Starts the streaming server. Returns the assigned port (0 on web).
-  int startServer({int port = 0});
+  Future<int> startServer({int port = 0});
 
   /// Stops the streaming server.
   void stopServer();

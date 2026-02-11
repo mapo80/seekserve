@@ -253,6 +253,18 @@ ss_error_t ss_get_file_size(SeekServeEngine* engine, const char* torrent_id,
     return SS_OK;
 }
 
+#ifdef __EMSCRIPTEN__
+ss_error_t ss_read_bytes_wasm(SeekServeEngine* engine, const char* torrent_id,
+                               int32_t file_index,
+                               uint32_t offset_lo, uint32_t offset_hi,
+                               uint32_t length_lo, uint32_t length_hi,
+                               uint8_t* out_buf, uint64_t* out_bytes_read) {
+    uint64_t offset = static_cast<uint64_t>(offset_lo) | (static_cast<uint64_t>(offset_hi) << 32);
+    uint64_t length = static_cast<uint64_t>(length_lo) | (static_cast<uint64_t>(length_hi) << 32);
+    return ss_read_bytes(engine, torrent_id, file_index, offset, length, out_buf, out_bytes_read);
+}
+#endif
+
 void ss_free_string(char* str) {
     delete[] str;
 }

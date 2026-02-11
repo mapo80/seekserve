@@ -35,6 +35,6 @@ set_target_properties(seekserve-capi PROPERTIES
 if(EMSCRIPTEN)
     set_target_properties(seekserve-capi PROPERTIES
         SUFFIX ".js"
-        LINK_FLAGS "-pthread -sPROXY_TO_PTHREAD -sNO_EXIT_RUNTIME=1 -sALLOW_MEMORY_GROWTH=1 -sPTHREAD_POOL_SIZE=4 -sEXPORTED_FUNCTIONS=['_ss_engine_create','_ss_engine_destroy','_ss_add_torrent','_ss_remove_torrent','_ss_list_torrents','_ss_list_files','_ss_select_file','_ss_get_stream_url','_ss_get_status','_ss_set_event_callback','_ss_start_server','_ss_stop_server','_ss_free_string','_ss_read_bytes','_ss_get_file_size','_malloc','_free'] -sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','UTF8ToString','stringToUTF8','lengthBytesUTF8','HEAPU8','HEAPU32','HEAPU16'] -sMODULARIZE=1 -sEXPORT_NAME='SeekServeModule'"
+        LINK_FLAGS "-pthread -sPROXY_TO_PTHREAD -sNO_EXIT_RUNTIME=1 -sALLOW_MEMORY_GROWTH=1 -sPTHREAD_POOL_SIZE=4 -lidbfs.js -sFORCE_FILESYSTEM=1 -sEXPORTED_FUNCTIONS=['_ss_engine_create','_ss_engine_destroy','_ss_add_torrent','_ss_remove_torrent','_ss_list_torrents','_ss_list_files','_ss_select_file','_ss_get_stream_url','_ss_get_status','_ss_set_event_callback','_ss_start_server','_ss_stop_server','_ss_free_string','_ss_read_bytes','_ss_read_bytes_wasm','_ss_get_file_size','_malloc','_free'] -sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','UTF8ToString','stringToUTF8','lengthBytesUTF8','HEAPU8','HEAPU32','HEAPU16','FS'] -sMODULARIZE=1 -sEXPORT_NAME='SeekServeModule'"
     )
 endif()

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>SeekServe Video Streaming E2E Test</title>
+  <!-- Required for SharedArrayBuffer (Emscripten pthreads) -->
+  <meta http-equiv="Cross-Origin-Opener-Policy" content="same-origin">
+  <meta http-equiv="Cross-Origin-Embedder-Policy" content="require-corp">
+</head>
+<body>
+  <h3 id="status">Loading WASM scripts...</h3>
+  <div id="video-container"></div>
+
+  <!-- Emscripten output -->
+  <script src="seekserve.js"></script>
+  <!-- JS glue layer -->
+  <script src="seekserve_wasm.js"></script>
+
+  <script>
+    'use strict';
+
+    window.__testEngine = null;
+    window.__testReady = false;
+
+    // --- Service Worker registration ---
+
+    async function setupServiceWorker() {
+      if (!('serviceWorker' in navigator)) {
+        throw new Error('Service Workers not supported');
+      }
+
+      const sw = navigator.serviceWorker;
+
+      // Unregister existing SWs for clean state
+      const regs = await sw.getRegistrations();
+      for (const reg of regs) {
+        await reg.unregister();
+      }
+
+      // Register with cache-bust
+      const ts = Date.now();
+      await sw.register(`seekserve_sw.js?v=${ts}`);
+      await sw.ready;
+
+      // Wait for the SW to claim this page
+      if (!sw.controller) {
+        await new Promise((resolve) => {
+          const handler = () => {
+            sw.removeEventListener('controllerchange', handler);
+            resolve();
+          };
+          sw.addEventListener('controllerchange', handler);
+          setTimeout(resolve, 5000); // Timeout fallback
+        });
+      }
+
+      console.log('[Test] SW registered and controlling page');
+      return sw.controller !== null;
+    }
+
+    // --- SW message handler ---
+    // Proxies readBytes/getFileSize from the Service Worker to the WASM engine.
+
+    navigator.serviceWorker.addEventListener('message', (event) => {
+      const engine = window.__testEngine;
+      if (!engine) return;
+
+      const data = event.data;
+      const port = event.ports[0];
+      if (!port) return;
+
+      if (data.type === 'seekserve-readBytes') {
+        const result = window.SeekServeWasm.readBytes(
+          engine, data.torrentId, data.fileIndex, data.offset, data.length);
+        port.postMessage({ error: result.error, data: result.data });
+      } else if (data.type === 'seekserve-getFileSize') {
+        const result = window.SeekServeWasm.getFileSize(
+          engine, data.torrentId, data.fileIndex);
+        port.postMessage({ error: result.error, size: result.size });
+      }
+    });
+
+    // --- Init ---
+
+    (async () => {
+      try {
+        document.getElementById('status').textContent = 'Registering Service Worker...';
+        const swOk = await setupServiceWorker();
+        document.getElementById('status').textContent = swOk
+          ? 'SW active. Ready for E2E test.'
+          : 'SW registered but not controlling. Reload may be needed.';
+        window.__testReady = true;
+      } catch (e) {
+        document.getElementById('status').textContent = 'Error: ' + e.message;
+        console.error('[Test] Setup error:', e);
+      }
+    })();
+  </script>
+</body>
+</html>

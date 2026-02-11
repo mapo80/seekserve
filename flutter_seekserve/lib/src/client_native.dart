@@ -51,7 +51,7 @@ class SeekServeClientNative implements SeekServeClient {
   Stream<SeekServeEvent> get events => _eventController.stream;
 
   @override
-  int startServer({int port = 0}) {
+  Future<int> startServer({int port = 0}) async {
     _ensureNotDisposed();
     final outPort = calloc<Uint16>();
     try {

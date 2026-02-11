@@ -70,7 +70,7 @@ class SeekServeClientWasm implements SeekServeClient {
   Stream<SeekServeEvent> get events => _eventController.stream;
 
   @override
-  int startServer({int port = 0}) {
+  Future<int> startServer({int port = 0}) async {
     _ensureNotDisposed();
     final result = _jsCall(
       () => seekServeWasm.startServer(_engine, port.toJS) as JsPortResult,
@@ -79,8 +79,8 @@ class SeekServeClientWasm implements SeekServeClient {
     final err = result.error.toDartInt;
     checkError(err);
 
-    // Register Service Worker
-    _registerServiceWorker();
+    // Register Service Worker and wait for it to control the page.
+    await _registerServiceWorker();
 
     // Set up message listener for Service Worker byte requests
     _setupSwMessageHandler();
@@ -115,6 +115,8 @@ class SeekServeClientWasm implements SeekServeClient {
     );
     final err = result.error.toDartInt;
     checkError(err);
+    // Persist SQLite changes to IndexedDB (fire-and-forget).
+    seekServeWasm.syncFs();
     return result.id!.toDart;
   }
 
@@ -142,6 +144,8 @@ class SeekServeClientWasm implements SeekServeClient {
       'removeTorrent',
     );
     checkError(err.toDartInt);
+    // Persist SQLite changes to IndexedDB (fire-and-forget).
+    seekServeWasm.syncFs();
   }
 
   @override
@@ -221,13 +225,48 @@ class SeekServeClientWasm implements SeekServeClient {
     } catch (_) {}
   }
 
-  void _registerServiceWorker() {
+  Future<void> _registerServiceWorker() async {
     final sw = web.window.navigator.serviceWorker;
-    sw.register('seekserve_sw.js'.toJS);
+
+    // Force-unregister any existing SW so the browser fetches the latest script.
+    final regs = await sw.getRegistrations().toDart;
+    _log('Unregistering ${regs.toDart.length} existing SW(s)');
+    for (final reg in regs.toDart) {
+      await reg.unregister().toDart;
+    }
+
+    // Cache-bust: append timestamp so the browser never serves a stale script.
+    final ts = DateTime.now().millisecondsSinceEpoch;
+    final swUrl = 'seekserve_sw.js?v=$ts';
+    _log('Registering SW: $swUrl');
+    await sw.register(swUrl.toJS).toDart;
+
+    // Wait until the SW is actively controlling this page.
+    await sw.ready.toDart;
+    _log('SW ready');
+
+    // Wait for clients.claim() to take effect (SW controls this page).
+    if (sw.controller == null) {
+      _log('Waiting for SW to claim this page...');
+      final completer = Completer<void>();
+      late final void Function(web.Event) handler;
+      handler = (web.Event _) {
+        sw.removeEventListener('controllerchange', handler.toJS);
+        completer.complete();
+      };
+      sw.addEventListener('controllerchange', handler.toJS);
+      await completer.future.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () =>
+            _log('WARNING: SW controller not set after 5s'),
+      );
+    }
+    _log('SW controller: ${sw.controller != null ? "active" : "null"}');
   }
 
   void _setupSwMessageHandler() {
     // Listen for messages from the Service Worker requesting byte reads
+    _log('SW message handler registered');
     web.window.navigator.serviceWorker.addEventListener(
       'message',
       ((web.MessageEvent event) {
@@ -259,6 +298,11 @@ class SeekServeClientWasm implements SeekServeClient {
         _engine, torrentId.toJS, fileIndex.toJS, offset.toJS, length.toJS)
         as JsReadResult;
 
+    final err = result.error.toDartInt;
+    if (err != 0) {
+      _log('readBytes(offset=$offset, len=$length) → err=$err');
+    }
+
     final port = ports.toDart[0];
     final response = JSObject();
     response.setProperty('error'.toJS, result.error);
@@ -267,6 +311,7 @@ class SeekServeClientWasm implements SeekServeClient {
   }
 
   void _handleSwGetFileSize(JSObject data, JSArray<web.MessagePort> ports) {
+    _log('getFileSize request received');
     final torrentId =
         data.getProperty<JSString>('torrentId'.toJS).toDart;
     final fileIndex =
@@ -310,6 +355,10 @@ class SeekServeClientWasm implements SeekServeClient {
   }
 
   // --- Helpers ---
+
+  static void _log(String msg) {
+    web.console.log('[SeekServe Dart] $msg'.toJS);
+  }
 
   static bool _hasSharedArrayBuffer() {
     final sab = globalContext.getProperty<JSAny?>('SharedArrayBuffer'.toJS);

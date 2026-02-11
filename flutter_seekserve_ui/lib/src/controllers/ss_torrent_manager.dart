@@ -88,7 +88,7 @@ class SsTorrentManager extends ChangeNotifier {
 
       await _client!.initialize();
 
-      final port = _client!.startServer();
+      final port = await _client!.startServer();
       _serverPort = port > 0 ? port : null;
       _startedAt = DateTime.now();
       _authToken = (config ?? SeekServeConfig(savePath: savePath)).authToken;

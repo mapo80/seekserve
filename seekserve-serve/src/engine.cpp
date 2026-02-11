@@ -188,6 +188,11 @@ void SeekServeEngine::wire_alerts() {
             auto piece = static_cast<PieceIndex>(a.piece_index);
 
             std::lock_guard lock(mu_);
+#ifdef __EMSCRIPTEN__
+            // Always track at engine level so select_file() can pre-populate
+            // PieceAvailabilityIndex for pieces downloaded before TorrentState exists.
+            completed_pieces_[id].insert(piece);
+#endif
             auto* state = find_state(id);
             if (state) {
                 state->avail.mark_complete(piece);
@@ -255,6 +260,9 @@ Result<void> SeekServeEngine::remove_torrent(const TorrentId& id, bool delete_fi
         std::lock_guard lock(mu_);
         removed_ids_.insert(id);
         states_.erase(id);
+#ifdef __EMSCRIPTEN__
+        completed_pieces_.erase(id);
+#endif
     }
     catalog_.remove(id);
     return sessions_->remove_torrent(id, delete_files);
@@ -328,12 +336,34 @@ Result<void> SeekServeEngine::select_file(const TorrentId& id, FileIndex fi) {
     auto file_path = (std::filesystem::path(config_.session.save_path) /
                       file_info.value().path).string();
 
+    // On WASM, use a short timeout (500ms) since each read_bytes() call
+    // blocks the JS main thread via PROXY_TO_PTHREAD. The service worker
+    // retry loop handles waiting for pieces with its own backoff.
+#ifdef __EMSCRIPTEN__
+    auto read_timeout = std::chrono::milliseconds(500);
+#else
+    auto read_timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
+        config_.server.read_timeout);
+#endif
     state->source = std::make_shared<ByteSource>(
-        handle, fi, file_path, *state->mapper, state->avail,
-        std::chrono::duration_cast<std::chrono::milliseconds>(config_.server.read_timeout));
+        handle, fi, file_path, *state->mapper, state->avail, read_timeout);
 
     state->scheduler = std::make_unique<StreamingScheduler>(
         config_.scheduler, state->avail, *state->mapper);
+
+#ifdef __EMSCRIPTEN__
+    // Proactively request the first ~1MB so libtorrent starts downloading
+    // the beginning of the file immediately, before the first readBytes().
+    {
+        auto file_size = state->source->file_size();
+        auto prefetch_end = std::min(static_cast<std::int64_t>(1024 * 1024),
+                                     file_size) - 1;
+        if (prefetch_end > 0) {
+            ByteRange range{0, prefetch_end};
+            state->scheduler->on_range_request(range, handle);
+        }
+    }
+#endif
 
     // Register byte source on HTTP server if running
 #ifndef __EMSCRIPTEN__
@@ -352,6 +382,21 @@ Result<void> SeekServeEngine::select_file(const TorrentId& id, FileIndex fi) {
 
     {
         std::lock_guard lock(mu_);
+#ifdef __EMSCRIPTEN__
+        // Pre-populate availability from pieces completed before TorrentState
+        // was created.  On WASM we can't use handle.status(query_pieces)
+        // (deadlocks), so we replay the accumulated piece_finished_alerts.
+        if (auto it = completed_pieces_.find(id); it != completed_pieces_.end()) {
+            int populated = 0;
+            for (auto p : it->second) {
+                state->avail.mark_complete(p);
+                ++populated;
+            }
+            if (populated > 0) {
+                spdlog::debug("Engine: pre-populated {} pieces for {}", populated, id);
+            }
+        }
+#endif
         states_[id] = std::move(state);
     }
 
@@ -607,10 +652,11 @@ void SeekServeEngine::on_tick(const boost::system::error_code& ec) {
 Result<std::size_t> SeekServeEngine::read_bytes(const TorrentId& id, FileIndex fi,
                                                  std::uint64_t offset, std::uint64_t length,
                                                  std::uint8_t* out_buf) {
-    // Grab source pointer under lock, then release — read() blocks on cv_
-    // and piece_finished_alert handler also takes mu_, so holding mu_ here
-    // would deadlock.
+    // Grab source + scheduler pointers under lock, then release — read()
+    // blocks on cv_ and piece_finished_alert handler also takes mu_, so
+    // holding mu_ here would deadlock.
     std::shared_ptr<ByteSource> source;
+    StreamingScheduler* sched = nullptr;
     {
         std::lock_guard lock(mu_);
         auto* state = find_state(id);
@@ -618,6 +664,19 @@ Result<std::size_t> SeekServeEngine::read_bytes(const TorrentId& id, FileIndex f
         if (state->selected_file != fi) return make_error_code(errc::file_not_found);
         if (!state->source) return make_error_code(errc::metadata_not_ready);
         source = state->source;
+        sched = state->scheduler.get();
+    }
+
+    // Notify scheduler so it sets piece deadlines for the requested range.
+    // On native this is done via the HTTP server's range callback; on WASM
+    // there is no HTTP server, so we call it directly here.
+    if (sched) {
+        ByteRange range{static_cast<std::int64_t>(offset),
+                        static_cast<std::int64_t>(offset + length - 1)};
+        auto handle = sessions_->get_handle(id);
+        if (handle.is_valid()) {
+            sched->on_range_request(range, handle);
+        }
     }
 
     auto result = source->read(static_cast<std::int64_t>(offset),

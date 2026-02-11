@@ -22,6 +22,7 @@ extension type SeekServeWasmBridge._(JSObject _) implements JSObject {
       JSNumber fileIndex, JSNumber offset, JSNumber length);
   external JSObject getFileSize(
       JSNumber engine, JSString torrentId, JSNumber fileIndex);
+  external JSPromise<JSAny?> syncFs();
 }
 
 /// Helper to access window.SeekServeWasm.

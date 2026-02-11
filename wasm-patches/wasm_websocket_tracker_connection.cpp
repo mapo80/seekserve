@@ -309,8 +309,17 @@ void wasm_websocket_tracker_connection::handle_message(std::string const& json_s
 {
 #ifndef TORRENT_DISABLE_LOGGING
 	if (auto cb = requester())
+	{
+		// Sanitize: replace non-printable bytes with '.' to avoid UB in %s
+		// (tracker JSON contains raw binary in info_hash, offer_id, peer_id)
+		std::string safe(json_str);
+		for (auto& ch : safe)
+			if (static_cast<unsigned char>(ch) < 0x20 || static_cast<unsigned char>(ch) > 0x7e)
+				ch = '.';
+		if (safe.size() > 512) safe.resize(512);
 		cb->debug_log("*** WASM_WS_TRACKER_READ [ size: %ld, data: %s ]"
-			, long(json_str.size()), json_str.c_str());
+			, long(json_str.size()), safe.c_str());
+	}
 #endif
 
 	error_code ec;

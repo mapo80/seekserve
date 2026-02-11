@@ -23,6 +23,14 @@ class PlayerArgs {
 }
 
 class AppRouter {
+  static Route<dynamic> _homeRoute(RouteSettings settings) {
+    return PageRouteBuilder(
+      settings: const RouteSettings(name: '/'),
+      pageBuilder: (ctx, a1, a2) => const HomeScreen(),
+      transitionsBuilder: _fade,
+    );
+  }
+
   static Route<dynamic> generateRoute(RouteSettings settings) {
     switch (settings.name) {
       case '/':
@@ -33,22 +41,28 @@ class AppRouter {
         );
 
       case '/detail':
-        final args = settings.arguments as TorrentDetailArgs;
+        if (settings.arguments is! TorrentDetailArgs) {
+          return _homeRoute(settings);
+        }
+        final detailArgs = settings.arguments as TorrentDetailArgs;
         return PageRouteBuilder(
           settings: settings,
           pageBuilder: (ctx, a1, a2) =>
-              TorrentDetailScreen(torrentId: args.torrentId),
+              TorrentDetailScreen(torrentId: detailArgs.torrentId),
           transitionsBuilder: _fade,
         );
 
       case '/player':
-        final args = settings.arguments as PlayerArgs;
+        if (settings.arguments is! PlayerArgs) {
+          return _homeRoute(settings);
+        }
+        final playerArgs = settings.arguments as PlayerArgs;
         return PageRouteBuilder(
           settings: settings,
           pageBuilder: (ctx, a1, a2) => AppPlayerScreen(
-            streamUrl: args.streamUrl,
-            torrentId: args.torrentId,
-            fileName: args.fileName,
+            streamUrl: playerArgs.streamUrl,
+            torrentId: playerArgs.torrentId,
+            fileName: playerArgs.fileName,
           ),
           transitionsBuilder: _fade,
         );

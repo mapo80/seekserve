@@ -95,6 +95,21 @@ ss_error_t ss_get_file_size(SeekServeEngine* engine,
 __attribute__((visibility("default")))
 void ss_free_string(char* str);
 
+#ifdef __EMSCRIPTEN__
+/* WASM-only wrapper: Emscripten splits uint64_t VALUE params into two i32s at
+   the ABI level, but cwrap('number') only passes one i32 per param.  This
+   wrapper accepts offset and length as explicit (lo, hi) pairs so that JS
+   cwrap can call it correctly with 'number' arguments. */
+__attribute__((visibility("default")))
+ss_error_t ss_read_bytes_wasm(SeekServeEngine* engine,
+                               const char* torrent_id,
+                               int32_t file_index,
+                               uint32_t offset_lo, uint32_t offset_hi,
+                               uint32_t length_lo, uint32_t length_hi,
+                               uint8_t* out_buf,
+                               uint64_t* out_bytes_read);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

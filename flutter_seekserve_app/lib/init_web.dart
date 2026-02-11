@@ -7,6 +7,7 @@ void platformInit() {
 Future<SeekServeConfig> getPlatformConfig() async {
   return const SeekServeConfig(
     savePath: '/seekserve',
+    cacheDbPath: '/seekserve/seekserve_cache.db',
     logLevel: 'debug',
   );
 }

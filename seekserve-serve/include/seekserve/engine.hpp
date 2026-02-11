@@ -133,6 +133,12 @@ private:
     };
     std::unordered_map<TorrentId, CachedStatus> cached_statuses_;
     mutable std::mutex status_mu_;
+
+    // Accumulate piece completions per torrent so that select_file() can
+    // pre-populate PieceAvailabilityIndex.  On WASM we skip handle.status(query_pieces)
+    // (would deadlock), and piece_finished_alerts that fire before TorrentState
+    // creation are otherwise lost.  Protected by mu_.
+    std::unordered_map<TorrentId, std::unordered_set<PieceIndex>> completed_pieces_;
 #endif
 };
 

@@ -35,7 +35,9 @@ class ByteSourceTest : public ::testing::Test {
 protected:
     void SetUp() override {
         // Create temp directory and file
-        tmp_dir_ = std::filesystem::temp_directory_path() / "seekserve_test_m3";
+        tmp_dir_ = std::filesystem::temp_directory_path() /
+            ("seekserve_test_m3_" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(tmp_dir_);
         file_path_ = (tmp_dir_ / "test.bin").string();
 

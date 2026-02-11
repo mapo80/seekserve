@@ -21,6 +21,27 @@ async function _initSeekServe(wasmBaseUrl) {
     locateFile: (path) => (wasmBaseUrl ? wasmBaseUrl + '/' + path : path),
   });
 
+  // Mount IDBFS at /seekserve so SQLite DB persists to IndexedDB.
+  // Gracefully degrade if WASM was built without -lidbfs.js.
+  const FS = _module.FS;
+  const IDBFS = _module.IDBFS || (FS.filesystems && FS.filesystems.IDBFS);
+  if (IDBFS) {
+    try { FS.mkdir('/seekserve'); } catch (e) { /* already exists */ }
+    FS.mount(IDBFS, {}, '/seekserve');
+
+    // Populate MEMFS from IndexedDB (read=true means IDB→MEMFS).
+    await new Promise((resolve) => {
+      FS.syncfs(true, (err) => {
+        if (err) { console.warn('[SeekServe] IDBFS initial sync failed:', err); }
+        resolve();
+      });
+    });
+    console.log('[SeekServe] IDBFS mounted and synced from IndexedDB');
+  } else {
+    console.warn('[SeekServe] IDBFS not available — torrents will not persist across reloads');
+    try { FS.mkdir('/seekserve'); } catch (e) { /* already exists */ }
+  }
+
   _cw = {
     ss_engine_create: _module.cwrap('ss_engine_create', 'number', ['string']),
     ss_engine_destroy: _module.cwrap('ss_engine_destroy', null, ['number']),
@@ -35,7 +56,7 @@ async function _initSeekServe(wasmBaseUrl) {
     ss_start_server: _module.cwrap('ss_start_server', 'number', ['number', 'number', 'number']),
     ss_stop_server: _module.cwrap('ss_stop_server', 'number', ['number']),
     ss_free_string: _module.cwrap('ss_free_string', null, ['number']),
-    ss_read_bytes: _module.cwrap('ss_read_bytes', 'number', ['number', 'string', 'number', 'number', 'number', 'number', 'number']),
+    ss_read_bytes_wasm: _module.cwrap('ss_read_bytes_wasm', 'number', ['number', 'string', 'number', 'number', 'number', 'number', 'number', 'number', 'number']),
     ss_get_file_size: _module.cwrap('ss_get_file_size', 'number', ['number', 'string', 'number', 'number']),
   };
 }
@@ -157,7 +178,14 @@ function stopServer(engine) {
 function readBytes(engine, torrentId, fileIndex, offset, length) {
   const buf = _module._malloc(length);
   const outBytesRead = _module._malloc(8);
-  const err = _cw.ss_read_bytes(engine, torrentId, fileIndex, offset, length, buf, outBytesRead);
+  // Split uint64_t offset/length into (lo, hi) pairs for WASM ABI compatibility.
+  // Emscripten splits uint64_t VALUE params into two i32s, but cwrap('number')
+  // only passes one i32. ss_read_bytes_wasm accepts explicit (lo, hi) pairs.
+  const offsetLo = offset >>> 0;
+  const offsetHi = Math.floor(offset / 0x100000000) >>> 0;
+  const lengthLo = length >>> 0;
+  const lengthHi = Math.floor(length / 0x100000000) >>> 0;
+  const err = _cw.ss_read_bytes_wasm(engine, torrentId, fileIndex, offsetLo, offsetHi, lengthLo, lengthHi, buf, outBytesRead);
   if (err !== 0) {
     _module._free(buf);
     _module._free(outBytesRead);
@@ -185,6 +213,23 @@ function getFileSize(engine, torrentId, fileIndex) {
   return { error: 0, size: sizeLo + sizeHi * 0x100000000 };
 }
 
+/**
+ * Flush MEMFS changes to IndexedDB (IDBFS persist).
+ * Call after any operation that mutates the SQLite DB (add/remove torrent).
+ * @returns {Promise<void>}
+ */
+function syncFs() {
+  if (!_module) return Promise.resolve();
+  const IDBFS = _module.IDBFS || (_module.FS.filesystems && _module.FS.filesystems.IDBFS);
+  if (!IDBFS) return Promise.resolve(); // No persistence available
+  return new Promise((resolve) => {
+    _module.FS.syncfs(false, (err) => {
+      if (err) console.warn('[SeekServe] IDBFS sync failed:', err);
+      resolve();
+    });
+  });
+}
+
 // Expose on window for dart:js_interop access
 window.SeekServeWasm = {
   init: _initSeekServe,
@@ -201,5 +246,6 @@ window.SeekServeWasm = {
   stopServer: stopServer,
   readBytes: readBytes,
   getFileSize: getFileSize,
+  syncFs: syncFs,
   module: () => _module,
 };
