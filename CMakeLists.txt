@@ -39,6 +39,10 @@ if(SEEKSERVE_BUILD_DEMO AND NOT EMSCRIPTEN)
     add_subdirectory(seekserve-demo)
 endif()
 
+if(NOT EMSCRIPTEN)
+    add_subdirectory(tools)
+endif()
+
 if(SEEKSERVE_BUILD_TESTS AND NOT EMSCRIPTEN)
     enable_testing()
     add_subdirectory(tests)

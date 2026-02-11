@@ -64,6 +64,8 @@ class SeekServeClientWasm implements SeekServeClient {
         'Check browser console (F12) for C++ errors.',
       );
     }
+    // Expose engine handle for E2E testing / JS interop.
+    globalContext.setProperty('__seekserveEngine'.toJS, _engine);
   }
 
   @override

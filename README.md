@@ -1928,6 +1928,192 @@ Supported responses: `200 OK` (full file), `206 Partial Content` (range request)
 - **COOP/COEP restrictions** — `SharedArrayBuffer` requires strict cross-origin isolation, which may block some third-party resources
 - **Binary size** — the WASM module is ~4-5 MB; consider lazy loading and `-Oz` optimization for production
 
+### Local E2E WebTorrent Test
+
+Fully local test of the complete streaming pipeline: WebSocket tracker + native seeder + WASM browser client downloading via WebRTC + video playback in the Flutter web app. **No external network required** — all traffic stays on localhost.
+
+```
+Tracker WS (:8000)
+    ↕                    ↕
+Native seeder          Flutter Web App (Chrome)
+(libdatachannel)  ←WebRTC→  (datachannel-wasm/WASM)
+seeds video            downloads pieces → StreamingScheduler → SW → <video>
+```
+
+#### Prerequisites
+
+| # | What | Command |
+|---|------|---------|
+| 1 | **Video file** (any MP4, e.g. Big Buck Bunny 263 MB) | Place in `downloads/bbb_sunflower_1080p_30fps_normal.mp4` |
+| 2 | **Native C++ build** (seeder binary) | `./setup.sh debug` |
+| 3 | **WASM build** (seekserve.wasm) | `docker/build-wasm.sh && scripts/deploy-wasm-to-app.sh` |
+| 4 | **Flutter web app** | `cd flutter_seekserve_app && flutter build web` |
+| 5 | **Node.js + npm** | `npm install ws` (CDP client) |
+| 6 | **Generate .torrent** (once) | `python3 scripts/create_test_torrent.py` |
+
+After step 6, the torrent file is at `fixtures/local_test/bbb_sunflower.torrent` and the script prints the infohash + magnet URI.
+
+#### Option A: One command (recommended)
+
+```bash
+./scripts/run_local_e2e.sh
+```
+
+Starts tracker, seeder, web server, and Chrome. Then **waits** — you test manually in the browser. Press **Ctrl+C** to stop everything.
+
+Flags:
+
+| Flag | Description |
+|------|-------------|
+| `--build` | Build native + Flutter web before starting |
+| `--e2e` | Run automated CDP test (10 checks) instead of waiting |
+| `--screenshots` | Take PNG screenshots after E2E test (implies `--e2e`) |
+
+Examples:
+
+```bash
+# Manual testing (default): starts services, opens Chrome, waits
+./scripts/run_local_e2e.sh
+
+# Build everything first, then manual testing
+./scripts/run_local_e2e.sh --build
+
+# Automated E2E test with screenshots
+./scripts/run_local_e2e.sh --e2e --screenshots
+```
+
+Screenshots are saved in `/tmp/seekserve-screenshots/`.
+
+#### Option B: Manual (5 terminals)
+
+Open 5 terminal windows:
+
+**Terminal 1 — WebSocket tracker**
+
+```bash
+npx bittorrent-tracker --ws --ws-port 8000
+```
+
+**Terminal 2 — Native seeder**
+
+```bash
+./build/debug/tools/seekserve-seed \
+  fixtures/local_test/bbb_sunflower.torrent \
+  downloads/ \
+  ws://localhost:8000/announce
+```
+
+Wait for `Seeding...` and status updates every 5 seconds.
+
+**Terminal 3 — Web server (COOP/COEP headers)**
+
+```bash
+python3 serve_coop.py 8080 flutter_seekserve_app/build/web
+```
+
+The COOP/COEP headers are required for `SharedArrayBuffer` (Emscripten pthreads).
+
+**Terminal 4 — Chrome**
+
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir=/tmp/chrome-e2e-local \
+  --no-first-run \
+  http://localhost:8080/
+```
+
+The app loads, WASM initializes (~5s), engine starts. Check the Console (F12) for `[SeekServe Dart]` logs.
+
+**Terminal 5 — CDP test (automated)**
+
+```bash
+node scripts/e2e/test_local_streaming_e2e.mjs \
+  "magnet:?xt=urn:btih:31ed292ddb90f45afcbf3b4c9009b84aacee5de6&dn=bbb_sunflower_1080p_30fps_normal.mp4&tr=ws://127.0.0.1:8000/announce"
+```
+
+Or for screenshots only:
+
+```bash
+node scripts/e2e/take_screenshots.mjs
+```
+
+#### Option C: Manual browser test (no CDP, no Node)
+
+After starting terminals 1-4 above, open Chrome DevTools (F12) and paste in the Console:
+
+**1. Add torrent:**
+
+```javascript
+SeekServeWasm.addTorrent(
+  window.__seekserveEngine,
+  'magnet:?xt=urn:btih:31ed292ddb90f45afcbf3b4c9009b84aacee5de6&dn=bbb_sunflower_1080p_30fps_normal.mp4&tr=ws://localhost:8000/announce'
+)
+```
+
+**2. Monitor download progress:**
+
+```javascript
+setInterval(() => {
+  const r = SeekServeWasm.getStatus(
+    window.__seekserveEngine,
+    '31ed292ddb90f45afcbf3b4c9009b84aacee5de6'
+  );
+  const s = JSON.parse(r.json);
+  console.log(
+    `${(s.progress * 100).toFixed(1)}% ` +
+    `peers=${s.num_peers} ` +
+    `dl=${(s.download_rate / 1024).toFixed(0)} KB/s ` +
+    `meta=${s.has_metadata}`
+  );
+}, 3000);
+```
+
+Wait until you see `peers=1` and `progress > 3%`.
+
+**3. Select file and stream video:**
+
+```javascript
+const ID = '31ed292ddb90f45afcbf3b4c9009b84aacee5de6';
+SeekServeWasm.selectFile(window.__seekserveEngine, ID, 0);
+const url = SeekServeWasm.getStreamUrl(window.__seekserveEngine, ID, 0);
+
+const v = document.createElement('video');
+v.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:99999;background:black;object-fit:contain;';
+v.src = url.url;
+v.autoplay = true;
+v.muted = true;
+v.controls = true;
+document.body.appendChild(v);
+```
+
+The video should start playing within a few seconds. To remove it: `document.querySelector('video').remove()`.
+
+#### What It Tests
+
+| Step | What | Pass criteria |
+|------|------|---------------|
+| 1. WASM init | Module loads in Flutter app | `SeekServeWasm.module()` exists |
+| 2. Engine | Flutter app creates engine with WebTorrent | `window.__seekserveEngine > 0` |
+| 3. Service Worker | SW active and controlling page | `navigator.serviceWorker.controller` not null |
+| 4. Add torrent | Magnet URI → engine | `torrentId` returned |
+| 5. Metadata | Received from seeder via WS tracker → WebRTC | `has_metadata: true` |
+| 6. Download | Pieces arrive via WebRTC data channel | `readBytes(offset=0)` returns data |
+| 7. SW HEAD | Service Worker intercepts fetch | `200 OK` + `Accept-Ranges: bytes` |
+| 8. SW Range | Byte-range streaming via SW | `206 Partial Content` with body |
+| 9. Video | HTML5 `<video>` plays from SW stream | `canplay` or `loadedmetadata` event |
+| 10. Playback | Video rendering frames | `currentTime > 0` |
+
+#### Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `SharedArrayBuffer not available` | Missing COOP/COEP headers | Use `serve_coop.py`, not `python3 -m http.server` |
+| `peers=0`, no download | Seeder or tracker not running | Check terminals 1-2 are up, seeder shows `Seeding...` |
+| `readBytes err=-4` | Pieces at file start not yet downloaded | Wait longer, StreamingScheduler prioritizes start pieces |
+| WASM not loading | Stale service worker cache | Clear SW: DevTools → Application → Service Workers → Unregister, then hard refresh |
+| Video black / no playback | Offset 0 pieces not ready | Wait for `readBytes(offset=0)` to return data before creating `<video>` |
+
 ---
 
 ## Documentation Index

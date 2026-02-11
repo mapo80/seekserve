@@ -28,12 +28,8 @@
   <script src="seekserve.js"></script>
   <!-- JS glue layer for Dart ↔ WASM bridge -->
   <script src="seekserve_wasm.js"></script>
-  <!-- Service Worker registration -->
-  <script>
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('seekserve_sw.js');
-    }
-  </script>
+  <!-- Service Worker is registered by Dart code (client_wasm.dart) — not here,
+       to avoid race conditions with Flutter's loader and the Dart SW manager. -->
 
   <script src="flutter_bootstrap.js" async></script>
 </body>

@@ -9,5 +9,6 @@ Future<SeekServeConfig> getPlatformConfig() async {
     savePath: '/seekserve',
     cacheDbPath: '/seekserve/seekserve_cache.db',
     logLevel: 'debug',
+    enableWebtorrent: true,
   );
 }
