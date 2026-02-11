@@ -7,6 +7,7 @@ library;
 export 'src/seekserve_client.dart';
 export 'src/seekserve_exception.dart';
 export 'src/models/file_info.dart';
+export 'src/models/pieces_info.dart';
 export 'src/models/torrent_status.dart';
 export 'src/models/seekserve_config.dart';
 export 'src/models/seekserve_event.dart';

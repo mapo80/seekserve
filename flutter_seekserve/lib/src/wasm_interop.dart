@@ -16,6 +16,7 @@ extension type SeekServeWasmBridge._(JSObject _) implements JSObject {
   external JSObject getStreamUrl(
       JSNumber engine, JSString torrentId, JSNumber fileIndex);
   external JSObject getStatus(JSNumber engine, JSString torrentId);
+  external JSObject getPieces(JSNumber engine, JSString torrentId);
   external JSObject startServer(JSNumber engine, JSNumber port);
   external JSNumber stopServer(JSNumber engine);
   external JSObject readBytes(JSNumber engine, JSString torrentId,

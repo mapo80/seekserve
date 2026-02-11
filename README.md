@@ -70,6 +70,7 @@ The SDK ships with three Flutter packages:
 - **Intelligent piece scheduler** — hot window, lookahead, seek boost, adaptive mode switching
 - **Multi-file torrent support** — enumerate files, select one for streaming, correct per-file byte mapping
 - **Offline cache** — SQLite-backed, LRU eviction, quota enforcement, offline-ready detection
+- **Pieces map API** — per-piece bitfield + per-file piece ranges with completion counts, hex-encoded for compact transfer
 - **C API** — opaque handle, JSON data exchange, callback events — ready for Flutter FFI / Dart `ffigen`
 - **REST control API** — add/remove torrents, list files, select streams, monitor status via JSON
 - **Hardened servers** — connection limits, socket timeouts, body size limits, token auth, CORS
@@ -89,7 +90,7 @@ The SDK ships with three Flutter packages:
 - **No Material/Cupertino dependency** — only `flutter/widgets.dart`, `painting.dart`, `gestures.dart`
 - **Theme system** — `SsThemeData` + `SsTheme` (InheritedWidget), dark/light presets, torrent-semantic colours, `copyWith()` customization
 - **9 atom widgets** — `SsButton`, `SsIconButton`, `SsTextField`, `SsProgressBar`, `SsBadge`, `SsChip`, `SsSlider`, `SsCard`, `SsDialog`
-- **11 composite widgets** — `SsTorrentTile`, `SsFileTile`, `SsFileTree`, `SsTransferStats`, `SsStreamModeBadge`, `SsAddTorrentBar`, `SsAddTorrentDialog`, `SsTorrentList`, `SsTorrentDetail`, `SsDeleteConfirm`, `SsServerStatusPanel`
+- **12 composite widgets** — `SsTorrentTile`, `SsFileTile`, `SsFileTree`, `SsPiecesMap`, `SsTransferStats`, `SsStreamModeBadge`, `SsAddTorrentBar`, `SsAddTorrentDialog`, `SsTorrentList`, `SsTorrentDetail`, `SsDeleteConfirm`, `SsServerStatusPanel`
 - **4 player widgets** — `SsSeekControls`, `SsBufferingOverlay`, `SsPlayerStatusBar`, `SsVideoPlayer`
 - **1 controller** — `SsTorrentManager` (ChangeNotifier wrapping `SeekServeClient`)
 - **32 Dart unit tests** for theme, atoms, utils
@@ -97,7 +98,7 @@ The SDK ships with three Flutter packages:
 ### Flutter App (Example)
 - **Example application** — demonstrates SDK integration with `WidgetsApp` (no MaterialApp), 3 screens, full torrent management
 - **Home screen** — add torrent bar, torrent list with swipe-to-delete, status badges, error banner
-- **Torrent detail screen** — full metadata panel, file tree with folder navigation, tap-to-stream
+- **Torrent detail screen** — full metadata panel, pieces map (per-file grid), file tree with folder navigation, tap-to-stream
 - **Player screen** — `SsVideoPlayer` with seek controls, buffering overlay, torrent status bar
 - **ManagerScope** — InheritedWidget providing `SsTorrentManager` to the entire widget tree
 
@@ -308,7 +309,8 @@ Three Flutter packages form a layered architecture. Each layer depends only on t
        v                               |       |
   TorrentDetailScreen                  |       | dart:ffi
     +-- SsTorrentDetail (ui)           |       v
-    +-- SsFileTree (ui)                |  ss_get_status() -> JSON
+    +-- SsPiecesMap (ui)               |  ss_get_status() -> JSON
+    +-- SsFileTree (ui)                |  ss_get_pieces() -> JSON
          |                             |
          | User taps video file        |
          v                             |
@@ -1307,6 +1309,7 @@ The `flutter_seekserve_ui` package provides a complete set of themed widgets for
 | **Composite** | `SsTorrentTile` | Torrent row: name, progress bar, DL/UL rates, peer count, state badge |
 | **Composite** | `SsTorrentList` | Scrollable list with swipe-to-delete via `Dismissible` |
 | **Composite** | `SsTorrentDetail` | Full metadata panel: infohash, size, files, playhead, deadlines |
+| **Composite** | `SsPiecesMap` | Per-file pieces grid (CustomPaint), playhead indicator, streaming file highlight |
 | **Composite** | `SsFileTile` | File row with type icon (video/audio/subtitle/image/doc) |
 | **Composite** | `SsFileTree` | Expandable folder tree, auto-skips single root dir |
 | **Composite** | `SsTransferStats` | DL rate, UL rate, peer/seed count as `SsChip` widgets |
@@ -1540,6 +1543,7 @@ ss_error_t ss_list_files(engine, torrent_id, &out_json);
 ss_error_t ss_select_file(engine, torrent_id, file_index);
 ss_error_t ss_get_stream_url(engine, torrent_id, file_index, &out_url);
 ss_error_t ss_get_status(engine, torrent_id, &out_json);
+ss_error_t ss_get_pieces(engine, torrent_id, &out_json);
 
 // Server
 ss_error_t ss_start_server(engine, port, &out_port);

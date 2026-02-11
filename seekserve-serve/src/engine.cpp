@@ -513,6 +513,85 @@ std::string SeekServeEngine::get_status_json(const TorrentId& id) {
 #endif
 }
 
+std::string SeekServeEngine::get_pieces_json(const TorrentId& id) {
+    json result;
+
+    auto ti = catalog_.torrent_info(id);
+    if (!ti) {
+        result["error"] = "metadata not ready";
+        return result.dump();
+    }
+
+    int num_pieces = ti->num_pieces();
+    int piece_length = ti->piece_length();
+
+    result["num_pieces"] = num_pieces;
+    result["piece_length"] = piece_length;
+
+    // File ranges with per-file completed counts
+    auto files_result = catalog_.list_files(id);
+    auto selected = catalog_.selected_file(id);
+    result["selected_file"] = selected.has_value() ? json(*selected) : json(nullptr);
+
+    {
+        std::lock_guard lock(mu_);
+        auto* state = find_state(id);
+
+        // Bitfield: 1 bit per piece, MSB first, hex-encoded
+        if (state) {
+            int num_bytes = (num_pieces + 7) / 8;
+            std::vector<uint8_t> bitfield(num_bytes, 0);
+            for (int p = 0; p < num_pieces; ++p) {
+                if (state->avail.is_complete(p)) {
+                    bitfield[p / 8] |= (0x80 >> (p % 8));
+                }
+            }
+            // Hex-encode
+            std::string hex;
+            hex.reserve(num_bytes * 2);
+            static const char digits[] = "0123456789abcdef";
+            for (auto byte : bitfield) {
+                hex.push_back(digits[byte >> 4]);
+                hex.push_back(digits[byte & 0x0f]);
+            }
+            result["bitfield"] = std::move(hex);
+
+            if (state->scheduler) {
+                result["playhead_piece"] = state->scheduler->playhead_piece();
+            } else {
+                result["playhead_piece"] = nullptr;
+            }
+        } else {
+            result["bitfield"] = "";
+            result["playhead_piece"] = nullptr;
+        }
+
+        // Per-file info with completed piece counts
+        if (files_result) {
+            json files_arr = json::array();
+            for (const auto& f : files_result.value()) {
+                json fj;
+                fj["index"] = f.index;
+                fj["name"] = f.path;
+                fj["first_piece"] = f.first_piece;
+                fj["end_piece"] = f.end_piece;
+
+                int completed = 0;
+                if (state) {
+                    for (int p = f.first_piece; p < f.end_piece; ++p) {
+                        if (state->avail.is_complete(p)) ++completed;
+                    }
+                }
+                fj["completed"] = completed;
+                files_arr.push_back(std::move(fj));
+            }
+            result["files"] = std::move(files_arr);
+        }
+    }
+
+    return result.dump();
+}
+
 Result<std::uint16_t> SeekServeEngine::start_server(std::uint16_t port) {
     if (server_running_.load()) {
         return make_error_code(errc::server_already_running);

@@ -63,6 +63,7 @@ public:
     // Streaming
     Result<std::string> get_stream_url(const TorrentId& id, FileIndex fi);
     std::string get_status_json(const TorrentId& id);
+    std::string get_pieces_json(const TorrentId& id);
 
     // Direct byte access (used by WASM via Service Worker)
     Result<std::size_t> read_bytes(const TorrentId& id, FileIndex fi,

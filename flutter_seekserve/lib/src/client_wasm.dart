@@ -9,6 +9,7 @@ import 'seekserve_client.dart';
 import 'seekserve_exception.dart';
 import 'wasm_interop.dart';
 import 'models/file_info.dart';
+import 'models/pieces_info.dart';
 import 'models/torrent_status.dart';
 import 'models/seekserve_config.dart';
 import 'models/seekserve_event.dart';
@@ -213,6 +214,23 @@ class SeekServeClientWasm implements SeekServeClient {
     final jsonStr = result.json!.toDart;
     final map = jsonDecode(jsonStr) as Map<String, dynamic>;
     return TorrentStatus.fromJson(map);
+  }
+
+  @override
+  PiecesInfo? getPieces(String torrentId) {
+    _ensureNotDisposed();
+    final result = _jsCall(
+      () =>
+          seekServeWasm.getPieces(_engine, torrentId.toJS) as JsStringResult,
+      'getPieces',
+    );
+    final err = result.error.toDartInt;
+    checkError(err);
+    final jsonStr = result.json?.toDart;
+    if (jsonStr == null) return null;
+    final map = jsonDecode(jsonStr) as Map<String, dynamic>;
+    if (map.containsKey('error')) return null;
+    return PiecesInfo.fromJson(map);
   }
 
   @override

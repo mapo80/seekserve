@@ -24,6 +24,7 @@ export 'src/composites/ss_add_torrent_bar.dart';
 export 'src/composites/ss_add_torrent_dialog.dart';
 export 'src/composites/ss_delete_confirm.dart';
 export 'src/composites/ss_file_tile.dart';
+export 'src/composites/ss_pieces_map.dart';
 export 'src/composites/ss_server_status_panel.dart';
 export 'src/composites/ss_file_tree.dart';
 export 'src/composites/ss_stream_mode_badge.dart';

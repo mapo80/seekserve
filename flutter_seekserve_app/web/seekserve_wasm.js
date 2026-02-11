@@ -52,6 +52,7 @@ async function _initSeekServe(wasmBaseUrl) {
     ss_select_file: _module.cwrap('ss_select_file', 'number', ['number', 'string', 'number']),
     ss_get_stream_url: _module.cwrap('ss_get_stream_url', 'number', ['number', 'string', 'number', 'number']),
     ss_get_status: _module.cwrap('ss_get_status', 'number', ['number', 'string', 'number']),
+    ss_get_pieces: _module.cwrap('ss_get_pieces', 'number', ['number', 'string', 'number']),
     ss_set_event_callback: _module.cwrap('ss_set_event_callback', 'number', ['number', 'number', 'number']),
     ss_start_server: _module.cwrap('ss_start_server', 'number', ['number', 'number', 'number']),
     ss_stop_server: _module.cwrap('ss_stop_server', 'number', ['number']),
@@ -159,6 +160,18 @@ function getStatus(engine, torrentId) {
   return { error: 0, json: json };
 }
 
+function getPieces(engine, torrentId) {
+  const outPtr = _module._malloc(4);
+  const err = _cw.ss_get_pieces(engine, torrentId, outPtr);
+  if (err !== 0) {
+    _module._free(outPtr);
+    return { error: err, json: null };
+  }
+  const json = _readOutString(outPtr);
+  _module._free(outPtr);
+  return { error: 0, json: json };
+}
+
 function startServer(engine, port) {
   const outPtr = _module._malloc(2);
   const err = _cw.ss_start_server(engine, port, outPtr);
@@ -242,6 +255,7 @@ window.SeekServeWasm = {
   selectFile: selectFile,
   getStreamUrl: getStreamUrl,
   getStatus: getStatus,
+  getPieces: getPieces,
   startServer: startServer,
   stopServer: stopServer,
   readBytes: readBytes,

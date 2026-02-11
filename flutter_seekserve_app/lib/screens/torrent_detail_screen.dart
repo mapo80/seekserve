@@ -59,6 +59,7 @@ class _TorrentDetailScreenState extends State<TorrentDetailScreen> {
     final manager = context.manager;
     final status = manager.getStatus(widget.torrentId);
     final files = manager.listFiles(widget.torrentId);
+    final piecesInfo = manager.getPieces(widget.torrentId);
     final error = manager.errorMessage;
     final metadataReady = status?.hasMetadata == true;
 
@@ -115,6 +116,16 @@ class _TorrentDetailScreenState extends State<TorrentDetailScreen> {
                 : ListView(
                     children: [
                       SsTorrentDetail(status: status, files: files),
+                      if (piecesInfo != null && piecesInfo.files.isNotEmpty) ...[
+                        Padding(
+                          padding: const EdgeInsets.only(left: 16, top: 8),
+                          child: Text('Pieces', style: theme.headingStyle),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                          child: SsPiecesMap(info: piecesInfo),
+                        ),
+                      ],
                       if (files.isNotEmpty) ...[
                         Padding(
                           padding: const EdgeInsets.only(left: 16, top: 8),

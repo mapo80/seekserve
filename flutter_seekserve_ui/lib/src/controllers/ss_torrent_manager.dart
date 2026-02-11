@@ -211,6 +211,16 @@ class SsTorrentManager extends ChangeNotifier {
     return _torrents[torrentId]?.status;
   }
 
+  /// Gets piece-level status for a torrent.
+  PiecesInfo? getPieces(String torrentId) {
+    if (_client == null) return null;
+    try {
+      return _client!.getPieces(torrentId);
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Gets the entry for a torrent.
   SsTorrentEntry? getEntry(String torrentId) => _torrents[torrentId];
 

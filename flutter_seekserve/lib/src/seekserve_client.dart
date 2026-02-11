@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'models/file_info.dart';
+import 'models/pieces_info.dart';
 import 'models/torrent_status.dart';
 import 'models/seekserve_config.dart';
 import 'models/seekserve_event.dart';
@@ -52,6 +53,10 @@ abstract class SeekServeClient {
 
   /// Gets the current status of a torrent.
   TorrentStatus getStatus(String torrentId);
+
+  /// Gets piece-level status: bitfield + per-file ranges.
+  /// Returns null if metadata is not yet available.
+  PiecesInfo? getPieces(String torrentId);
 
   /// Releases all resources.
   void dispose();

@@ -10,6 +10,7 @@ import 'native_library.dart';
 import 'seekserve_client.dart';
 import 'seekserve_exception.dart';
 import 'models/file_info.dart';
+import 'models/pieces_info.dart';
 import 'models/torrent_status.dart';
 import 'models/seekserve_config.dart';
 import 'models/seekserve_event.dart';
@@ -187,6 +188,27 @@ class SeekServeClientNative implements SeekServeClient {
       final jsonStr = outJson.value.cast<Utf8>().toDartString();
       final map = jsonDecode(jsonStr) as Map<String, dynamic>;
       return TorrentStatus.fromJson(map);
+    } finally {
+      if (outJson.value != nullptr) {
+        _bindings.ss_free_string(outJson.value);
+      }
+      calloc.free(outJson);
+      calloc.free(idPtr);
+    }
+  }
+
+  @override
+  PiecesInfo? getPieces(String torrentId) {
+    _ensureNotDisposed();
+    final idPtr = torrentId.toNativeUtf8().cast<Char>();
+    final outJson = calloc<Pointer<Char>>();
+    try {
+      final err = _bindings.ss_get_pieces(_engine, idPtr, outJson);
+      checkError(err);
+      final jsonStr = outJson.value.cast<Utf8>().toDartString();
+      final map = jsonDecode(jsonStr) as Map<String, dynamic>;
+      if (map.containsKey('error')) return null;
+      return PiecesInfo.fromJson(map);
     } finally {
       if (outJson.value != nullptr) {
         _bindings.ss_free_string(outJson.value);

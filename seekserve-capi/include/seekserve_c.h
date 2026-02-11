@@ -65,6 +65,11 @@ ss_error_t ss_get_status(SeekServeEngine* engine,
                          char** out_json);
 
 __attribute__((visibility("default")))
+ss_error_t ss_get_pieces(SeekServeEngine* engine,
+                         const char* torrent_id,
+                         char** out_json);
+
+__attribute__((visibility("default")))
 ss_error_t ss_set_event_callback(SeekServeEngine* engine,
                                  ss_event_callback_t callback,
                                  void* user_data);

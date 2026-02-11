@@ -190,6 +190,15 @@ ss_error_t ss_get_status(SeekServeEngine* engine, const char* torrent_id,
     return *out_json ? SS_OK : SS_ERR_IO;
 }
 
+ss_error_t ss_get_pieces(SeekServeEngine* engine, const char* torrent_id,
+                         char** out_json) {
+    if (!engine || !torrent_id || !out_json) return SS_ERR_INVALID_ARG;
+
+    auto pieces_str = engine->get_pieces_json(torrent_id);
+    *out_json = alloc_string(pieces_str);
+    return *out_json ? SS_OK : SS_ERR_IO;
+}
+
 ss_error_t ss_set_event_callback(SeekServeEngine* engine,
                                  ss_event_callback_t callback, void* user_data) {
     if (!engine) return SS_ERR_INVALID_ARG;

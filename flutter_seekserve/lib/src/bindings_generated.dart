@@ -239,6 +239,33 @@ class SeekServeBindings {
         )
       >();
 
+  int ss_get_pieces(
+    ffi.Pointer<SeekServeEngine> engine,
+    ffi.Pointer<ffi.Char> torrent_id,
+    ffi.Pointer<ffi.Pointer<ffi.Char>> out_json,
+  ) {
+    return _ss_get_pieces(engine, torrent_id, out_json);
+  }
+
+  late final _ss_get_piecesPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ss_error_t Function(
+            ffi.Pointer<SeekServeEngine>,
+            ffi.Pointer<ffi.Char>,
+            ffi.Pointer<ffi.Pointer<ffi.Char>>,
+          )
+        >
+      >('ss_get_pieces');
+  late final _ss_get_pieces = _ss_get_piecesPtr
+      .asFunction<
+        int Function(
+          ffi.Pointer<SeekServeEngine>,
+          ffi.Pointer<ffi.Char>,
+          ffi.Pointer<ffi.Pointer<ffi.Char>>,
+        )
+      >();
+
   int ss_set_event_callback(
     ffi.Pointer<SeekServeEngine> engine,
     ss_event_callback_t callback,
