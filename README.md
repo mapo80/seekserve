@@ -2191,6 +2191,65 @@ Supported responses: `200 OK` (full file), `206 Partial Content` (range request)
 | Run in Chrome (dev) | `flutter run -d chrome --web-header=Cross-Origin-Opener-Policy=same-origin --web-header=Cross-Origin-Embedder-Policy=require-corp` |
 | Run Dart tests on Chrome | `cd flutter_seekserve && flutter test --platform chrome` |
 
+### Persistence Model
+
+On page reload, torrents are **automatically re-added** from the SQLite cache DB (persisted via IDBFS → IndexedDB). However, downloaded piece data is lost — the download restarts from zero.
+
+#### What survives a reload
+
+| Data | Persists? | Mechanism | Sync frequency |
+|------|-----------|-----------|----------------|
+| Torrent list (magnet URIs) | **Yes** | SQLite `torrents` table | on add/remove |
+| File metadata (names, sizes) | **Yes** | SQLite `cache_entries` | on metadata_received |
+| Progress per file (0.0–1.0) | **Partial** | SQLite, written every 1s | syncFs only on add/remove |
+| `offline_ready` flag | **Partial** | SQLite, set on file_completed | syncFs only on add/remove |
+| Downloaded pieces (bytes) | **No** | MEMFS (RAM) | — |
+| File selection (which file streaming) | **No** | runtime state only | — |
+| Peer connections / DHT state | **No** | runtime state only | — |
+| Resume data (piece bitfield) | **No** | not implemented | — |
+
+#### Reload flow
+
+```
+Page reload
+    │
+    v
+IDBFS sync (IndexedDB → MEMFS)
+    │  seekserve_wasm.js: FS.syncfs(true, ...)
+    │  SQLite DB loaded into /seekserve/seekserve_cache.db
+    v
+Engine constructor
+    │  engine.cpp: cache_->list_torrent_uris()
+    │  → returns [(id, "magnet:?xt=urn:btih:..."), ...]
+    v
+Re-add each torrent
+    │  sessions_->add_torrent(uri)
+    │  → async_add_torrent on WASM
+    v
+DHT / tracker lookup
+    │  metadata_received_alert fires
+    │  catalog re-populated, cache_entries re-inserted
+    v
+Download restarts from piece 0
+    │  no resume data → no hash-check skip
+    │  previous bytes gone (MEMFS was cleared)
+    v
+Dart manager polls status
+    │  ss_torrent_manager.dart: listTorrents() → rebuilds UI
+```
+
+#### Why web differs from native
+
+On **native** (iOS/Android), libtorrent writes pieces to the real filesystem. On reload, the files are still on disk — libtorrent hash-checks them and resumes where it left off. No resume data API needed for basic persistence.
+
+On **WASM**, pieces live in MEMFS (RAM). Page reload = clean RAM = zero pieces. To resume, you'd need:
+
+1. **Periodic syncFs** — flush IDBFS to IndexedDB every 5–10s so progress/flags survive
+2. **Resume data** — `save_resume_data()` → serialize piece bitfield → store in SQLite → `read_resume_data()` on reload → skip hash-check
+3. **Piece persistence** — sync actual piece bytes to IndexedDB via IDBFS. This is the bottleneck: a 100 MB torrent = thousands of IndexedDB writes during download. Requires batching or streaming-range-only sync
+
+Blocks 1–2 improve UX (correct progress display, fast re-add). Block 3 is needed to avoid re-downloading — the hard part on WASM.
+
 ### Current Limitations
 
 - **WebTorrent peers only** — browser WASM connects via WebRTC data channels, not standard TCP/UDP BitTorrent. Seeds must have WebTorrent enabled to be reachable.
