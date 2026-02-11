@@ -2242,18 +2242,138 @@ Dart manager polls status
 
 On **native** (iOS/Android), libtorrent writes pieces to the real filesystem. On reload, the files are still on disk — libtorrent hash-checks them and resumes where it left off. No resume data API needed for basic persistence.
 
-On **WASM**, pieces live in MEMFS (RAM). Page reload = clean RAM = zero pieces. To resume, you'd need:
+On **WASM**, pieces live in MEMFS (RAM). Page reload = clean RAM = zero pieces. The planned solution uses **OPFS** (Origin Private File System) to persist piece bytes incrementally — see below.
 
-1. **Periodic syncFs** — flush IDBFS to IndexedDB every 5–10s so progress/flags survive
-2. **Resume data** — `save_resume_data()` → serialize piece bitfield → store in SQLite → `read_resume_data()` on reload → skip hash-check
-3. **Piece persistence** — sync actual piece bytes to IndexedDB via IDBFS. This is the bottleneck: a 100 MB torrent = thousands of IndexedDB writes during download. Requires batching or streaming-range-only sync
+#### Planned: OPFS Piece Persistence
 
-Blocks 1–2 improve UX (correct progress display, fast re-add). Block 3 is needed to avoid re-downloading — the hard part on WASM.
+The core problem: IDBFS `syncFs()` rewrites the **entire file** to IndexedDB on every sync. For a 100 MB video, that's 100 MB per sync — impractical during active download. OPFS solves this with **random-access writes at byte offset** (`accessHandle.write(data, {at: offset})`), so each piece write is only 256 KB.
+
+##### Why OPFS, not alternatives
+
+```
+                     IDBFS syncFs    IndexedDB/piece   OPFS Worker    WASMFS+OPFS
+                     ────────────    ───────────────   ───────────    ───────────
+
+Write 1 piece        rewrites         1 transaction     1 pwrite()     1 pwrite()
+(256 KB)             ENTIRE file      + struct clone     at offset      at offset
+                     (100 MB!)        (256 KB)          (256 KB)       (256 KB)
+
+Read latency         ~0.1ms (RAM)     N/A               ~0.1ms (RAM)   ~1-5ms (proxy)
+(during streaming)                                      reads MEMFS    reads OPFS
+
+Private browsing     works            works             fallback to    crashes
+                                                        MEMFS-only     (no OPFS)
+
+Multi-tab            works            works             works          exclusive lock
+                                                        (OPFS optional) (1 tab only)
+
+File download        Blob from RAM    concat entries    getFile()      getFile()
+(save to disk)       (full copy)      (slow assembly)   (zero-copy)    (zero-copy)
+
+Risk                 none             none              none           high
+                     (current)        (new schema)      (additive)     (replaces FS)
+```
+
+**OPFS Worker wins** because it combines the best of each:
+- Incremental writes (not full-file like IDBFS)
+- Zero-copy file download (`getFile()` → native Blob)
+- Reads stay in MEMFS (fastest possible — direct RAM, no proxy thread)
+- Graceful fallback (if OPFS unavailable → current volatile behavior)
+- Additive (doesn't replace the existing MEMFS + IDBFS stack)
+
+WASMFS+OPFS would be more elegant (transparent to C++) but reads go through a proxy thread (~1-5ms vs ~0.1ms for MEMFS), exclusive file locking breaks multi-tab, and no private browsing fallback.
+
+##### Architecture
+
+```
+                       DURING DOWNLOAD
+                       ────────────────
+
+WebRTC piece → libtorrent disk thread → MEMFS write (RAM, ~0.01ms)
+                                             │
+                                             │ piece_finished_alert
+                                             v
+                                     JS bridge: read piece from MEMFS
+                                             │  FS.read(fd, buf, offset, pieceLength)
+                                             v
+                                     OPFS Worker (dedicated Web Worker)
+                                             │  seekserve_opfs.js
+                                             │  accessHandle.write(data, {at: pieceOffset})
+                                             │  ~0.5ms per 256 KB, async, doesn't block streaming
+                                             v
+                                     Piece persists in OPFS (browser-managed storage)
+
+
+                       DURING STREAMING (unchanged)
+                       ────────────────
+
+<video> → Service Worker → ByteSource::read() → MEMFS (direct RAM, ~0.1ms per 64 KB)
+                                                  ↑
+                                                  Reads always from MEMFS, never OPFS
+                                                  Lowest possible latency for video playback
+
+
+                       ON PAGE RELOAD
+                       ──────────────
+
+1. IDBFS sync → SQLite DB loaded (torrent URIs, resume data)
+2. For each torrent:
+       │
+       v
+   OPFS Worker: accessHandle.read(fullFile)  (~200ms per 100 MB)
+       │  read from OPFS, write to MEMFS at correct path
+       v
+   Engine: add_torrent(uri, resume_data)
+       │  resume_data has piece bitfield → skip hash-check
+       │  OR without resume_data → hash-check (safe, slower)
+       v
+   Download resumes from missing pieces only
+
+
+                       FILE COMPLETED → SAVE TO DISK
+                       ─────────────────────────────
+
+file_completed_alert
+       │
+       v
+OPFS: fileHandle.getFile()  → native File/Blob (zero-copy, no RAM duplication)
+       │
+       v
+URL.createObjectURL(file)
+       │
+       v
+<a download="video.mp4">  → browser "Save As" dialog → user's real filesystem
+```
+
+##### Storage separation
+
+```
+SQLite DB (~100 KB)    →  IDBFS + IndexedDB   (proven, works in private browsing)
+Piece data (~100 MB+)  →  OPFS Worker          (random-access, incremental, zero-copy download)
+```
+
+IDBFS `syncFs()` for a 100 KB database is instant (~1ms). The performance problem only exists for large torrent files — that's what OPFS solves.
+
+##### Components to implement
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| OPFS Worker | `seekserve_opfs.js` (new) | Holds `FileSystemSyncAccessHandle` per file, receives pieces via `MessagePort`, writes at offset |
+| Piece bridge | `seekserve_wasm.js` | On `piece_finished`: read piece from MEMFS, post to OPFS Worker |
+| Resume data | `engine.cpp` + `offline_cache.cpp` | Periodic `save_resume_data()` → serialize bitfield → SQLite |
+| Boot restore | `seekserve_wasm.js` | On init: OPFS Worker reads files → writes to MEMFS before engine starts |
+| File download | `client_wasm.dart` + `seekserve_wasm.js` | `getFile()` → Blob → `<a download>` trigger |
+| Download UI | `flutter_seekserve_ui/` | Download button in file list, shown when `offline_ready` |
+| Fallback | `seekserve_wasm.js` | If OPFS unavailable (private browsing): skip persistence, current behavior |
+
+##### Browser requirements
+
+OPFS with `FileSystemSyncAccessHandle` requires Chrome 102+, Firefox 111+, Safari 15.2+. SeekServe already requires Chrome 119+ for `SharedArrayBuffer`, so OPFS is guaranteed available on all supported browsers. Exception: Firefox private browsing disables OPFS — the fallback is volatile MEMFS (current behavior).
 
 ### Current Limitations
 
 - **WebTorrent peers only** — browser WASM connects via WebRTC data channels, not standard TCP/UDP BitTorrent. Seeds must have WebTorrent enabled to be reachable.
-- **Partial piece persistence** — SQLite cache DB persists via IDBFS (IndexedDB), but downloaded piece data only syncs on add/remove torrent, not after each piece — pieces between syncs are lost on refresh
+- **No piece persistence yet** — SQLite cache DB persists via IDBFS, but downloaded piece data lives in MEMFS (RAM) and is lost on refresh. OPFS-based persistence is planned (see [Persistence Model](#persistence-model))
 - **No `SsSeekControls`** — the `media_kit` `Player` type doesn't exist on web; the HTML5 video player has its own built-in controls
 - **COOP/COEP restrictions** — `SharedArrayBuffer` requires strict cross-origin isolation, which may block some third-party resources
 - **Binary size** — the WASM module is ~4-5 MB; consider lazy loading and `-Oz` optimization for production
