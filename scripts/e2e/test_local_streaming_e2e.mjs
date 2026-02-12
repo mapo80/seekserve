@@ -593,6 +593,11 @@ async function main() {
 
   // Step 10: Test <video> element
   console.log('\nStep 10: Test <video> element');
+  // Ensure main thread is free — cwrap calls (getStatus) can block it
+  if (!(await isMainThreadFree())) {
+    info('Main thread blocked before video test — waiting 5s...');
+    await sleep(5000);
+  }
   try {
     const videoResult = await evaluateAsync(ws, `
       new Promise((resolve) => {
@@ -618,7 +623,7 @@ async function main() {
         video.src = '${streamUrl}';
         video.autoplay = true;
       })
-    `, 30000);
+    `, 45000);
 
     info(`Events: [${videoResult.events.join(', ')}], error: ${videoResult.error || 'none'}`);
     if (videoResult.events.includes('canplay')) {

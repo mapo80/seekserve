@@ -315,6 +315,26 @@ function stopServer(engine) {
   return _cw.ss_stop_server(engine);
 }
 
+/**
+ * Validate that a buffer contains no all-zero 256-byte blocks.
+ * Compressed video (H.264/AAC) has high entropy — 256 consecutive zero bytes
+ * is impossible in real video data. A zero block indicates either:
+ * - Pre-allocated MEMFS space (file created but piece not downloaded)
+ * - Partially downloaded piece (some 16KB blocks arrived, others still zeros)
+ */
+function _validateNonZero(buf, nread) {
+  const BLOCK = 256;
+  for (let pos = 0; pos < nread; pos += BLOCK) {
+    const end = Math.min(pos + BLOCK, nread);
+    let blockNonZero = false;
+    for (let i = pos; i < end; i++) {
+      if (buf[i] !== 0) { blockNonZero = true; break; }
+    }
+    if (!blockNonZero) return false;
+  }
+  return true;
+}
+
 function readBytes(engine, torrentId, fileIndex, offset, length) {
   const buf = _module._malloc(length);
   const outBytesRead = _module._malloc(8);
@@ -349,17 +369,8 @@ function readBytes(engine, torrentId, fileIndex, offset, length) {
         const readBuf = new Uint8Array(length);
         const nread = FS.read(fd, readBuf, 0, length, offset);
         FS.close(fd);
-        if (nread > 0) {
-          // Validate: pre-allocated regions are all zeros; real video data has high entropy.
-          // For compressed video (H.264/AAC), 256 consecutive zero bytes is impossible.
-          const checkLen = Math.min(256, nread);
-          let nonZero = false;
-          for (let i = 0; i < checkLen; i++) {
-            if (readBuf[i] !== 0) { nonZero = true; break; }
-          }
-          if (nonZero) {
-            return { error: 0, data: readBuf.slice(0, nread) };
-          }
+        if (nread > 0 && _validateNonZero(readBuf, nread)) {
+          return { error: 0, data: readBuf.slice(0, nread) };
         }
       } catch (e) { /* file not on MEMFS yet — return original error */ }
     }
