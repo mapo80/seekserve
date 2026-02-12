@@ -223,6 +223,14 @@ ss_error_t ss_set_event_callback(SeekServeEngine* engine,
     return SS_OK;
 }
 
+ss_error_t ss_force_reannounce(SeekServeEngine* engine, const char* torrent_id) {
+    if (!engine || !torrent_id) return SS_ERR_INVALID_ARG;
+
+    auto result = engine->force_reannounce(torrent_id);
+    if (!result) return map_error(result.error());
+    return SS_OK;
+}
+
 ss_error_t ss_start_server(SeekServeEngine* engine, uint16_t port,
                            uint16_t* out_port) {
     if (!engine) return SS_ERR_INVALID_ARG;

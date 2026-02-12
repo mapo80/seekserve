@@ -34,6 +34,7 @@ int main(int argc, char** argv) {
     const char* torrent_file = argv[1];
     const char* save_path = argv[2];
     const char* tracker = argc > 3 ? argv[3] : "ws://localhost:8000/announce";
+    const char* stun = argc > 4 ? argv[4] : nullptr;
 
     // Build config JSON
     std::string config = std::string("{") +
@@ -41,8 +42,11 @@ int main(int argc, char** argv) {
         "\"enable_webtorrent\":true," +
         "\"extra_trackers\":[\"" + tracker + "\"]," +
         "\"cache_db_path\":\"/tmp/seekserve_seeder_cache.db\"," +
-        "\"log_level\":\"info\"" +
-    "}";
+        "\"log_level\":\"info\"";
+    if (stun) {
+        config += std::string(",\"stun_server\":\"") + stun + "\"";
+    }
+    config += "}";
 
     printf("=== SeekServe Seeder ===\n");
     printf("Torrent:  %s\n", torrent_file);
@@ -85,6 +89,9 @@ int main(int argc, char** argv) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
+    int no_peers_ticks = 0;
+    bool has_metadata = false;
+
     while (g_running) {
         // Poll status every 5 seconds
         char* status_json = nullptr;
@@ -92,6 +99,32 @@ int main(int argc, char** argv) {
         if (err == SS_OK && status_json) {
             printf("\r[status] %s", status_json);
             fflush(stdout);
+
+            // Track metadata state
+            if (!has_metadata && strstr(status_json, "\"has_metadata\":true")) {
+                has_metadata = true;
+            }
+
+            // Parse num_peers to detect disconnection
+            const char* peers_key = strstr(status_json, "\"num_peers\":");
+            int num_peers = 0;
+            if (peers_key) {
+                num_peers = atoi(peers_key + strlen("\"num_peers\":"));
+            }
+
+            if (num_peers > 0) {
+                no_peers_ticks = 0;
+            } else if (has_metadata) {
+                no_peers_ticks++;
+                // After 3 ticks (15s) with no peers, force re-announce to
+                // send fresh SDP offers through the tracker
+                if (no_peers_ticks >= 3) {
+                    printf("\n[seeder] No peers for %ds, forcing re-announce\n", no_peers_ticks * 5);
+                    ss_force_reannounce(engine, torrent_id);
+                    no_peers_ticks = 0;
+                }
+            }
+
             ss_free_string(status_json);
         }
 

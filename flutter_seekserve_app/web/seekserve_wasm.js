@@ -59,8 +59,16 @@ async function _initSeekServe(wasmBaseUrl) {
         resolve(msg);
       }
     };
-    // Test OPFS availability
-    const testResult = await _postToOpfs({ type: 'list' });
+    _opfsWorker.onerror = (e) => {
+      console.warn('[SeekServe] OPFS worker error:', e.message || e);
+      // Resolve all pending promises so _initSeekServe doesn't hang
+      for (const [id, resolve] of _opfsPending.entries()) {
+        _opfsPending.delete(id);
+        resolve({ ok: false, error: 'worker-error' });
+      }
+    };
+    // Test OPFS availability (with timeout to prevent init hang)
+    const testResult = await _postToOpfs({ type: 'list' }, 5000);
     _opfsAvailable = testResult.ok;
     console.log('[SeekServe] OPFS available:', _opfsAvailable);
   } catch (e) {
@@ -69,12 +77,25 @@ async function _initSeekServe(wasmBaseUrl) {
   }
 
   // --- OPFS → MEMFS boot restore ---
+  // Reads piece data from OPFS and writes to MEMFS so libtorrent can
+  // hash-verify and resume. Guard against huge files (previous truncate bug)
+  // by capping restore size.
+  const MAX_RESTORE_BYTES = 100 * 1024 * 1024; // 100 MB cap per file
   if (_opfsAvailable) {
     try {
       const stored = await _postToOpfs({ type: 'list' });
       if (stored.ok && stored.data && stored.data.length > 0) {
         console.log('[SeekServe] Restoring', stored.data.length, 'file(s) from OPFS to MEMFS');
         for (const file of stored.data) {
+          // Skip files that are too large (likely pre-allocated but mostly empty)
+          if (file.size > MAX_RESTORE_BYTES) {
+            console.warn('[SeekServe] Skipping oversized OPFS file:', file.torrentId,
+              'index', file.fileIndex, '(' + (file.size / 1024 / 1024).toFixed(1) + ' MB)');
+            continue;
+          }
+          // Skip empty files (0 bytes = no actual data written)
+          if (!file.size || file.size === 0) continue;
+
           // Read __meta.json to get the correct MEMFS path
           const metaResult = await _postToOpfs({
             type: 'readMeta',
@@ -84,7 +105,6 @@ async function _initSeekServe(wasmBaseUrl) {
           if (metaResult.ok && metaResult.meta && metaResult.meta.memfsPath) {
             memfsPath = metaResult.meta.memfsPath;
           } else {
-            // Fallback: skip files without metadata (can't determine correct path)
             console.warn('[SeekServe] No __meta.json for', file.torrentId, '— skipping restore');
             continue;
           }
@@ -93,9 +113,8 @@ async function _initSeekServe(wasmBaseUrl) {
             type: 'restore',
             torrentId: file.torrentId,
             fileIndex: file.fileIndex,
-          });
-          if (result.ok && result.data) {
-            // Create directory tree recursively
+          }, 30000);
+          if (result.ok && result.data && result.data.length > 0) {
             _ensureDir(FS, memfsPath);
             try {
               const fd = FS.open(memfsPath, 'w');
@@ -319,21 +338,30 @@ function getFileSize(engine, torrentId, fileIndex) {
 /**
  * Send a message to the OPFS Worker and wait for a response.
  * @param {Object} msg - Message object with `type` and params.
+ * @param {number} [timeoutMs=10000] - Timeout in milliseconds (0 = no timeout).
  * @returns {Promise<Object>} Response from OPFS Worker.
  */
-function _postToOpfs(msg) {
+function _postToOpfs(msg, timeoutMs = 10000) {
   if (!_opfsWorker) return Promise.resolve({ ok: false, error: 'no-worker' });
-  return new Promise((resolve) => {
-    const id = ++_opfsMsgId;
-    msg.msgId = id;
+  const id = ++_opfsMsgId;
+  msg.msgId = id;
+  // Transfer Uint8Array buffers if present
+  const transfer = [];
+  if (msg.data instanceof Uint8Array) {
+    transfer.push(msg.data.buffer);
+  }
+  const sendPromise = new Promise((resolve) => {
     _opfsPending.set(id, resolve);
-    // Transfer Uint8Array buffers if present
-    const transfer = [];
-    if (msg.data instanceof Uint8Array) {
-      transfer.push(msg.data.buffer);
-    }
     _opfsWorker.postMessage(msg, transfer);
   });
+  if (timeoutMs <= 0) return sendPromise;
+  return Promise.race([
+    sendPromise,
+    new Promise((resolve) => setTimeout(() => {
+      _opfsPending.delete(id);
+      resolve({ ok: false, error: 'timeout' });
+    }, timeoutMs)),
+  ]);
 }
 
 /**
@@ -468,12 +496,12 @@ function opfsStopSync() {
     _opfsSyncTimer = null;
   }
   if (_opfsSyncState) {
-    // Final flush
+    // Final flush (fire-and-forget)
     _postToOpfs({
       type: 'flush',
       torrentId: _opfsSyncState.torrentId,
       fileIndex: _opfsSyncState.fileIndex,
-    });
+    }, 0);
     _opfsSyncState = null;
   }
 }
@@ -502,11 +530,13 @@ function _opfsSyncPieces() {
       const actualLen = Math.min(s.pieceLength, s.fileSize - fileOffset);
       if (actualLen <= 0) continue;
 
+      let fd = -1;
       try {
-        const fd = FS.open(s.memfsPath, 'r');
+        fd = FS.open(s.memfsPath, 'r');
         const buf = new Uint8Array(actualLen);
         FS.read(fd, buf, 0, actualLen, fileOffset);
         FS.close(fd);
+        fd = -1;
 
         _postToOpfs({
           type: 'writePiece',
@@ -514,10 +544,12 @@ function _opfsSyncPieces() {
           fileIndex: s.fileIndex,
           offset: fileOffset,
           data: buf,
-        });
+        }, 0); // fire-and-forget, no timeout
         s.syncedPieces.add(p);
         wrote++;
       } catch (e) {
+        // Close FD if open (prevents leak when FS.read throws)
+        if (fd !== -1) try { FS.close(fd); } catch (_) {}
         // File may not exist yet in MEMFS
         break;
       }
@@ -535,7 +567,7 @@ function _opfsSyncPieces() {
         type: 'flush',
         torrentId: s.torrentId,
         fileIndex: s.fileIndex,
-      });
+      }, 0); // fire-and-forget
       // Also persist SQLite resume_data to IndexedDB
       syncFs();
     }

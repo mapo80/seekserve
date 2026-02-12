@@ -71,6 +71,9 @@ public:
                                     std::uint8_t* out_buf);
     Result<std::uint64_t> get_file_size(const TorrentId& id, FileIndex fi);
 
+    // Tracker
+    Result<void> force_reannounce(const TorrentId& id);
+
     // Server lifecycle
     Result<std::uint16_t> start_server(std::uint16_t port = 0);
     void stop_server();

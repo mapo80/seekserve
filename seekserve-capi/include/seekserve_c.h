@@ -75,6 +75,10 @@ ss_error_t ss_set_event_callback(SeekServeEngine* engine,
                                  void* user_data);
 
 __attribute__((visibility("default")))
+ss_error_t ss_force_reannounce(SeekServeEngine* engine,
+                                const char* torrent_id);
+
+__attribute__((visibility("default")))
 ss_error_t ss_start_server(SeekServeEngine* engine,
                            uint16_t port,
                            uint16_t* out_port);

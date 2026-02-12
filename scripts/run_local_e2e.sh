@@ -133,11 +133,14 @@ if [ "$DO_BUILD" = true ]; then
     cd "$ROOT_DIR/flutter_seekserve_app" && flutter build web
 fi
 
-# Seeder binary
+# Seeder binary — prefer debug build (release build has a WebRTC SCTP state bug
+# that causes DcSctpTransport abort). Debug build works correctly for WebRTC.
 SEEDER="$ROOT_DIR/build/debug/tools/seekserve-seed"
 if [ ! -f "$SEEDER" ]; then
-    echo "  ERROR: Seeder binary not found at $SEEDER"
-    echo "  Run: ./setup.sh debug  (or pass --build)"
+    SEEDER="$ROOT_DIR/build/release/tools/seekserve-seed"
+fi
+if [ ! -f "$SEEDER" ]; then
+    echo "  ERROR: Seeder binary not found. Run: ./setup.sh release  (or pass --build)"
     exit 1
 fi
 echo "  Seeder binary: OK"
@@ -226,7 +229,10 @@ echo "  Tracker PID: ${PIDS[${#PIDS[@]}-1]}"
 
 echo ""
 echo "=== Step 3: Start native seeder ==="
-"$SEEDER" "$TORRENT" "$ROOT_DIR/downloads" "ws://127.0.0.1:${TRACKER_PORT}/announce" &
+# Use a localhost STUN that refuses instantly — avoids DNS timeout for
+# stun.l.google.com which causes flaky ICE negotiation.  For localhost
+# WebRTC we only need host candidates anyway.
+"$SEEDER" "$TORRENT" "$ROOT_DIR/downloads" "ws://127.0.0.1:${TRACKER_PORT}/announce" "stun:127.0.0.1:1" &
 PIDS+=($!)
 sleep 3
 echo "  Seeder PID: ${PIDS[${#PIDS[@]}-1]}"
@@ -254,9 +260,9 @@ fi
 
 echo ""
 echo "=== Step 5: Launch Chrome ==="
-# Disable STUN on browser side for local testing — Chrome's clean profile
-# often fails DNS for stun.l.google.com via P2P sockets. For localhost
-# WebRTC, host ICE candidates are sufficient (no NAT traversal needed).
+# Use raw IP candidates instead of mDNS for reliable localhost WebRTC.
+# Override STUN to localhost:1 (instant refuse) — avoids DNS timeout for
+# stun.l.google.com which Chrome's sandboxed DNS resolver can't resolve.
 "$CHROME" \
     --remote-debugging-port="$CDP_PORT" \
     --user-data-dir=/tmp/chrome-e2e-local \
@@ -264,7 +270,7 @@ echo "=== Step 5: Launch Chrome ==="
     --no-default-browser-check \
     --disable-extensions \
     --disable-features=WebRtcHideLocalIpsWithMdns \
-    "http://127.0.0.1:${WEB_PORT}/?stun_server=" &
+    "http://127.0.0.1:${WEB_PORT}/?stun_server=stun:127.0.0.1:1" &
 PIDS+=($!)
 sleep 5
 echo "  Chrome PID: ${PIDS[${#PIDS[@]}-1]}"

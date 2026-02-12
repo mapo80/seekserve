@@ -350,6 +350,15 @@ Result<void> SeekServeEngine::remove_torrent(const TorrentId& id, bool delete_fi
     return sessions_->remove_torrent(id, delete_files);
 }
 
+Result<void> SeekServeEngine::force_reannounce(const TorrentId& id) {
+    auto h = sessions_->get_handle(id);
+    if (!h.is_valid()) {
+        return make_error_code(errc::torrent_not_found);
+    }
+    h.force_reannounce();
+    return Result<void>{};
+}
+
 std::vector<TorrentId> SeekServeEngine::list_torrents() const {
     // Return from DB (ordered by added_at) rather than the session's
     // unordered_map so the UI shows torrents in insertion order.

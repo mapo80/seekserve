@@ -209,7 +209,8 @@ async function main() {
       piece2Ok: piece2Ok,
     };
   })()`);
-  if (restoreResult.ok && restoreResult.size === 1048576) {
+  // File size is 2 x 262144 = 524288 (no pre-allocation via truncate)
+  if (restoreResult.ok && restoreResult.size === 524288) {
     ok(`restore returned ${restoreResult.size} bytes`);
     if (restoreResult.piece1Ok && restoreResult.piece2Ok) {
       ok('restore data integrity verified');
@@ -231,7 +232,7 @@ async function main() {
     if (!r.ok) return { ok: false, error: r.error };
     return { ok: true, size: r.file.size, type: r.file.type };
   })()`);
-  if (getFileResult.ok && getFileResult.size === 1048576) {
+  if (getFileResult.ok && getFileResult.size === 524288) {
     ok(`getFile returned File with size=${getFileResult.size}`);
   } else {
     fail('getFile', JSON.stringify(getFileResult));

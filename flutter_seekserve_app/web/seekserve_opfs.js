@@ -49,8 +49,10 @@ async function handleInit({ torrentId, fileIndex, fileSize }) {
   const dir = await _getTorrentDir(torrentId);
   const fileHandle = await dir.getFileHandle(String(fileIndex), { create: true });
   const accessHandle = await fileHandle.createSyncAccessHandle();
-  // Pre-allocate file to expected size
-  accessHandle.truncate(fileSize);
+  // Do NOT pre-allocate (truncate) to full file size — OPFS will extend
+  // on write. Pre-allocating causes handleRestore to read back the entire
+  // pre-allocated size (hundreds of MB of zeros) on the next boot, causing
+  // OOM or extreme slowness.
   _handles.set(key, accessHandle);
   return { ok: true };
 }
