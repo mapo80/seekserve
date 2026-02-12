@@ -261,8 +261,10 @@ fi
 echo ""
 echo "=== Step 5: Launch Chrome ==="
 # Use raw IP candidates instead of mDNS for reliable localhost WebRTC.
-# Override STUN to localhost:1 (instant refuse) — avoids DNS timeout for
-# stun.l.google.com which Chrome's sandboxed DNS resolver can't resolve.
+# Use real Google STUN server — same as the native seeder. ICE gathering
+# completes in ~50ms instead of the 30s timeout with stun:127.0.0.1:1.
+# datachannel-wasm passes STUN URLs to browser's RTCPeerConnection which
+# handles DNS resolution natively (not through Emscripten).
 "$CHROME" \
     --remote-debugging-port="$CDP_PORT" \
     --user-data-dir=/tmp/chrome-e2e-local \
@@ -270,7 +272,7 @@ echo "=== Step 5: Launch Chrome ==="
     --no-default-browser-check \
     --disable-extensions \
     --disable-features=WebRtcHideLocalIpsWithMdns \
-    "http://127.0.0.1:${WEB_PORT}/?stun_server=stun:127.0.0.1:1" &
+    "http://127.0.0.1:${WEB_PORT}/?stun_server=stun:stun.l.google.com:19302" &
 PIDS+=($!)
 sleep 5
 echo "  Chrome PID: ${PIDS[${#PIDS[@]}-1]}"

@@ -14,6 +14,7 @@ let _opfsWorker = null;
 let _opfsAvailable = false;
 let _opfsMsgId = 0;
 const _opfsPending = new Map();
+const _filePaths = new Map(); // "torrentId/fileIndex" → "/seekserve/filename.mp4"
 
 /**
  * Initialise the WASM module.
@@ -149,6 +150,7 @@ async function _initSeekServe(wasmBaseUrl) {
     ss_free_string: _module.cwrap('ss_free_string', null, ['number']),
     ss_read_bytes_wasm: _module.cwrap('ss_read_bytes_wasm', 'number', ['number', 'string', 'number', 'number', 'number', 'number', 'number', 'number', 'number']),
     ss_get_file_size: _module.cwrap('ss_get_file_size', 'number', ['number', 'string', 'number', 'number']),
+    ss_force_reannounce: _module.cwrap('ss_force_reannounce', 'number', ['number', 'string']),
   };
 }
 
@@ -240,7 +242,25 @@ function listFiles(engine, torrentId) {
 }
 
 function selectFile(engine, torrentId, fileIndex) {
-  return _cw.ss_select_file(engine, torrentId, fileIndex);
+  const err = _cw.ss_select_file(engine, torrentId, fileIndex);
+  if (err === 0) {
+    try {
+      const filesResult = listFiles(engine, torrentId);
+      if (filesResult.error === 0 && filesResult.json) {
+        const parsed = JSON.parse(filesResult.json);
+        const files = parsed.files || parsed;
+        const file = files.find(f => f.index === fileIndex);
+        if (file && file.path) {
+          _filePaths.set(torrentId + '/' + fileIndex, '/seekserve/' + file.path);
+        }
+      }
+    } catch (e) { /* non-fatal: FS.read fallback simply not available */ }
+  }
+  return err;
+}
+
+function forceReannounce(engine, torrentId) {
+  return _cw.ss_force_reannounce(engine, torrentId);
 }
 
 function getStreamUrl(engine, torrentId, fileIndex) {
@@ -306,17 +326,46 @@ function readBytes(engine, torrentId, fileIndex, offset, length) {
   const lengthLo = length >>> 0;
   const lengthHi = Math.floor(length / 0x100000000) >>> 0;
   const err = _cw.ss_read_bytes_wasm(engine, torrentId, fileIndex, offsetLo, offsetHi, lengthLo, lengthHi, buf, outBytesRead);
-  if (err !== 0) {
+
+  if (err === 0) {
+    const bytesRead = _module.HEAPU32[outBytesRead >> 2];
+    const data = new Uint8Array(_module.HEAPU8.buffer, buf, bytesRead).slice();
     _module._free(buf);
     _module._free(outBytesRead);
-    return { error: err, data: null };
+    return { error: 0, data: data };
   }
-  // Read uint64 bytes_read (low 32 bits sufficient for practical read sizes)
-  const bytesRead = _module.HEAPU32[outBytesRead >> 2];
-  const data = new Uint8Array(_module.HEAPU8.buffer, buf, bytesRead).slice();
+
   _module._free(buf);
   _module._free(outBytesRead);
-  return { error: 0, data: data };
+
+  // FS.read fallback: data may be on MEMFS (written by WebRTC) but avail not updated yet.
+  // Only for err=-4 (SS_ERR_TIMEOUT = PieceAvailabilityIndex lag).
+  if (err === -4) {
+    const memfsPath = _filePaths.get(torrentId + '/' + fileIndex);
+    if (memfsPath) {
+      try {
+        const FS = _module.FS;
+        const fd = FS.open(memfsPath, 'r');
+        const readBuf = new Uint8Array(length);
+        const nread = FS.read(fd, readBuf, 0, length, offset);
+        FS.close(fd);
+        if (nread > 0) {
+          // Validate: pre-allocated regions are all zeros; real video data has high entropy.
+          // For compressed video (H.264/AAC), 256 consecutive zero bytes is impossible.
+          const checkLen = Math.min(256, nread);
+          let nonZero = false;
+          for (let i = 0; i < checkLen; i++) {
+            if (readBuf[i] !== 0) { nonZero = true; break; }
+          }
+          if (nonZero) {
+            return { error: 0, data: readBuf.slice(0, nread) };
+          }
+        }
+      } catch (e) { /* file not on MEMFS yet — return original error */ }
+    }
+  }
+
+  return { error: err, data: null };
 }
 
 function getFileSize(engine, torrentId, fileIndex) {
@@ -622,6 +671,7 @@ window.SeekServeWasm = {
   listTorrents: listTorrents,
   listFiles: listFiles,
   selectFile: selectFile,
+  forceReannounce: forceReannounce,
   getStreamUrl: getStreamUrl,
   getStatus: getStatus,
   getPieces: getPieces,
