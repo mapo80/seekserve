@@ -137,6 +137,7 @@ private:
         int num_peers{0}, num_seeds{0};
         std::int64_t total_download{0}, total_upload{0};
         int state{0};  // lt::torrent_status::state_t
+        bool has_metadata{false};
     };
     std::unordered_map<TorrentId, CachedStatus> cached_statuses_;
     mutable std::mutex status_mu_;

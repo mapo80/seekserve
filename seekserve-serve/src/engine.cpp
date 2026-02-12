@@ -9,10 +9,6 @@
 #include <libtorrent/file_storage.hpp>
 #include <libtorrent/write_resume_data.hpp>
 
-#ifdef __EMSCRIPTEN__
-#include <boost/asio/post.hpp>
-#endif
-
 #include <filesystem>
 
 namespace seekserve {
@@ -91,9 +87,11 @@ void SeekServeEngine::wire_alerts() {
     sessions_->alert_dispatcher().on<lt::metadata_received_alert>(
         [this](const lt::metadata_received_alert& a) {
 #ifdef __EMSCRIPTEN__
-            // On Emscripten, torrent_handle methods are blocking sync_calls that
-            // deadlock from the AlertDispatcher thread. Use id_from_handle()
-            // (safe weak_ptr comparison) and defer torrent_file() to ioc_ thread.
+            // On Emscripten, handle.torrent_file() is a sync_call to the session
+            // thread that deadlocks (session ↔ main thread proxy dependency).
+            // Instead, request save_resume_data (async, non-blocking).  The
+            // save_resume_data_alert will carry params.ti with the torrent_info,
+            // allowing catalog registration without any sync_call.
             auto handle = a.handle;
             auto id = sessions_->id_from_handle(handle);
             if (id.empty()) return;
@@ -103,36 +101,10 @@ void SeekServeEngine::wire_alerts() {
                 if (removed_ids_.count(id)) return;
             }
 
-            boost::asio::post(ioc_, [this, handle, id]() {
-                auto ti = handle.torrent_file();
-                if (!ti) return;
+            // Trigger async save — save_resume_data_alert handler will register catalog
+            handle.save_resume_data(lt::torrent_handle::save_info_dict);
 
-                catalog_.on_metadata_received(id, ti);
-
-                auto files_result = catalog_.list_files(id);
-                if (files_result) {
-                    cache_->on_torrent_added(id, files_result.value());
-                }
-
-                fire_event("metadata_received", "{\"torrent_id\":\"" + id + "\"}");
-
-                // Apply pending file selection from restore
-                FileIndex pending_fi = -1;
-                {
-                    std::lock_guard lock2(mu_);
-                    auto pit = pending_file_selections_.find(id);
-                    if (pit != pending_file_selections_.end()) {
-                        pending_fi = pit->second;
-                        pending_file_selections_.erase(pit);
-                    }
-                }
-                if (pending_fi >= 0) {
-                    auto sel_result = select_file(id, pending_fi);
-                    if (sel_result) {
-                        spdlog::info("Engine: auto-selected file {} for restored torrent {}", pending_fi, id);
-                    }
-                }
-            });
+            fire_event("metadata_received", "{\"torrent_id\":\"" + id + "\"}");
 #else
             auto ti = a.handle.torrent_file();
             auto st = a.handle.status(lt::torrent_handle::query_name);
@@ -186,13 +158,39 @@ void SeekServeEngine::wire_alerts() {
 #ifdef __EMSCRIPTEN__
             // On Emscripten, add_torrent() uses async_add_torrent() so the handle
             // isn't stored synchronously. Store it here when the alert arrives.
-            // Use info_hashes from the alert params — torrent_handle methods are
-            // blocking sync_calls that deadlock from the AlertDispatcher thread.
-            // Skip torrent_file() entirely; metadata processing will happen via
-            // metadata_received_alert (deferred to ioc_ thread).
             auto id = infohash_to_hex(a.params.info_hashes);
             sessions_->store_handle(a.handle, id);
             spdlog::info("Engine: torrent added (WASM) {}", id);
+
+            // If torrent_info is already available (e.g. .torrent file or restore
+            // from resume data), register catalog immediately — no sync_call needed
+            // since params.ti is already in the alert.
+            if (a.params.ti) {
+                FileIndex pending_fi = -1;
+                {
+                    std::lock_guard lock(mu_);
+                    if (!removed_ids_.count(id)) {
+                        catalog_.on_metadata_received(id, a.params.ti);
+                        auto files_result = catalog_.list_files(id);
+                        if (files_result) {
+                            cache_->on_torrent_added(id, files_result.value());
+                        }
+                        auto pit = pending_file_selections_.find(id);
+                        if (pit != pending_file_selections_.end()) {
+                            pending_fi = pit->second;
+                            pending_file_selections_.erase(pit);
+                        }
+                    }
+                }
+                if (pending_fi >= 0) {
+                    auto sel_result = select_file(id, pending_fi);
+                    if (sel_result) {
+                        spdlog::info("Engine: auto-selected file {} for restored torrent {}", pending_fi, id);
+                    }
+                }
+                fire_event("metadata_received", "{\"torrent_id\":\"" + id + "\"}");
+            }
+
             fire_event("torrent_added", "{\"torrent_id\":\"" + id + "\"}");
 #else
             auto ti = a.handle.torrent_file();
@@ -298,11 +296,12 @@ void SeekServeEngine::wire_alerts() {
                 cs.total_download = st.total_download;
                 cs.total_upload = st.total_upload;
                 cs.state = static_cast<int>(st.state);
+                cs.has_metadata = st.has_metadata;
             }
         });
 #endif
 
-    // save_resume_data_alert → persist resume data to SQLite
+    // save_resume_data_alert → persist resume data to SQLite + catalog registration
     sessions_->alert_dispatcher().on<lt::save_resume_data_alert>(
         [this](const lt::save_resume_data_alert& a) {
 #ifdef __EMSCRIPTEN__
@@ -316,6 +315,39 @@ void SeekServeEngine::wire_alerts() {
                 std::lock_guard lock(mu_);
                 if (removed_ids_.count(id)) return;
             }
+
+#ifdef __EMSCRIPTEN__
+            // On WASM, metadata_received_alert triggers save_resume_data() to
+            // obtain torrent_info without a sync_call.  If catalog doesn't have
+            // metadata yet but params.ti is available, register it now.
+            if (a.params.ti && !catalog_.has_metadata(id)) {
+                catalog_.on_metadata_received(id, a.params.ti);
+                spdlog::info("Engine: catalog registered from save_resume_data for {}", id);
+
+                auto files_result = catalog_.list_files(id);
+                if (files_result) {
+                    cache_->on_torrent_added(id, files_result.value());
+                }
+
+                // Apply pending file selection from restore
+                FileIndex pending_fi = -1;
+                {
+                    std::lock_guard lock(mu_);
+                    auto pit = pending_file_selections_.find(id);
+                    if (pit != pending_file_selections_.end()) {
+                        pending_fi = pit->second;
+                        pending_file_selections_.erase(pit);
+                    }
+                }
+                if (pending_fi >= 0) {
+                    auto sel_result = select_file(id, pending_fi);
+                    if (sel_result) {
+                        spdlog::info("Engine: auto-selected file {} for restored torrent {}", pending_fi, id);
+                    }
+                }
+            }
+#endif
+
             auto buf = lt::write_resume_data_buf(a.params);
             cache_->save_resume_data(id, buf);
             spdlog::debug("Engine: saved resume data for {} ({} bytes)", id, buf.size());
@@ -551,6 +583,9 @@ std::string SeekServeEngine::get_status_json(const TorrentId& id) {
             status_json["total_upload"] = 0;
             status_json["state"] = 0;
         }
+        // Use catalog as sole source of truth for has_metadata.
+        // This ensures selectFile() won't be called until catalog is registered
+        // (via save_resume_data_alert or add_torrent_alert with params.ti).
         status_json["has_metadata"] = catalog_.has_metadata(id);
         status_json["selected_file"] = selected.has_value() ? json(*selected) : json(nullptr);
 

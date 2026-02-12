@@ -157,14 +157,20 @@ async function main() {
   const ws = await connect(wsUrl);
   await sendCommand(ws, 'Runtime.enable');
 
-  // Capture console logs
+  // Capture console logs and runtime exceptions
   ws.on('message', (raw) => {
     const msg = JSON.parse(raw);
     if (msg.method === 'Runtime.consoleAPICalled') {
       const text = msg.params.args.map(a => a.value ?? a.description ?? '?').join(' ');
-      if (text.includes('[SeekServe') || text.includes('metadata') || text.includes('WebRTC') || text.includes('tracker') || text.includes('Error')) {
-        info(`[console] ${text.substring(0, 200)}`);
+      const type = msg.params.type; // 'log', 'warn', 'error', etc.
+      if (type === 'error' || type === 'warn' || text.includes('[SeekServe') || text.includes('metadata') || text.includes('WebRTC') || text.includes('tracker') || text.includes('Error') || text.includes('abort') || text.includes('Sctp') || text.includes('pthread') || text.includes('wasm')) {
+        info(`[console.${type}] ${text.substring(0, 300)}`);
       }
+    }
+    if (msg.method === 'Runtime.exceptionThrown') {
+      const exc = msg.params.exceptionDetails;
+      const desc = exc?.exception?.description || exc?.text || 'unknown';
+      info(`[EXCEPTION] ${desc.substring(0, 300)}`);
     }
   });
 
@@ -305,6 +311,19 @@ async function main() {
   } catch (e) { fail(`selectFile/getStreamUrl: ${e.message}`); }
 
   if (!streamUrl) { cleanup(ws, engine); return; }
+
+  // Diagnostic: check if main thread is still responsive
+  console.log('\nStep 6b: Diagnostic - main thread check');
+  try {
+    const diag = await evaluate(ws, `(() => {
+      const hasModule = !!window.SeekServeWasm?.module();
+      const hasPthread = typeof PThread !== 'undefined';
+      return JSON.stringify({ hasModule, hasPthread, timestamp: Date.now() });
+    })()`, 5000);
+    info(`Main thread OK: ${diag}`);
+  } catch (e) {
+    info(`WARNING: Main thread already blocked before readBytes: ${e.message}`);
+  }
 
   // Step 7: Wait for data to arrive (readBytes returns real data)
   console.log('\nStep 7: Wait for download (readBytes)');

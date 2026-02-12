@@ -229,10 +229,10 @@ echo "  Tracker PID: ${PIDS[${#PIDS[@]}-1]}"
 
 echo ""
 echo "=== Step 3: Start native seeder ==="
-# Use a localhost STUN that refuses instantly — avoids DNS timeout for
-# stun.l.google.com which causes flaky ICE negotiation.  For localhost
-# WebRTC we only need host candidates anyway.
-"$SEEDER" "$TORRENT" "$ROOT_DIR/downloads" "ws://127.0.0.1:${TRACKER_PORT}/announce" "stun:127.0.0.1:1" &
+# Native seeder can use default STUN (stun.l.google.com) — it has real DNS.
+# Don't pass local STUN here; libdatachannel may fail to gather ICE candidates
+# if the STUN server silently drops packets (port 1 = no listener).
+"$SEEDER" "$TORRENT" "$ROOT_DIR/downloads" "ws://127.0.0.1:${TRACKER_PORT}/announce" &
 PIDS+=($!)
 sleep 3
 echo "  Seeder PID: ${PIDS[${#PIDS[@]}-1]}"
